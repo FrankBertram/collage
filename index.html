@@ -1,0 +1,825 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Collage Studio — 4K Photo Collage Editor</title>
+
+    <!-- Tailwind Play CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              ink: { 900: '#0b0d10', 800: '#12161b', 700: '#1a2029', 600: '#252d39' },
+              accent: { DEFAULT: '#5eead4', soft: '#2dd4bf' },
+            },
+            boxShadow: { soft: '0 6px 24px -8px rgba(0,0,0,0.45)' },
+          },
+        },
+      };
+    </script>
+
+    <!-- React + Konva (UMD) -->
+    <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/konva@9.3.16/konva.min.js"></script>
+
+    <!-- Babel standalone: kompiliert JSX im Browser. Reicht für ein Single-File-Demo,
+         für richtige Builds würde man stattdessen Vite verwenden. -->
+    <script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+
+    <style>
+      html, body, #root { height: 100%; }
+      body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+      .scroll-thin::-webkit-scrollbar { width: 8px; height: 8px; }
+      .scroll-thin::-webkit-scrollbar-thumb { background: #2a3340; border-radius: 4px; }
+      .scroll-thin::-webkit-scrollbar-thumb:hover { background: #3b4658; }
+      .drop-active { outline: 2px dashed #5eead4; outline-offset: -8px; background: rgba(94,234,212,0.05); }
+    </style>
+  </head>
+  <body class="bg-ink-900 text-slate-100">
+    <div id="root"></div>
+
+    <script type="text/babel" data-presets="env,react">
+    // ============================================================================
+    //  Collage Studio — Single-File-Version
+    //  Alle Logik in einer Datei, da kein Build-Schritt vorhanden ist.
+    //  Modulare Aufteilung wie im npm-Projekt: constants → utils → store → komponenten.
+    // ============================================================================
+
+    const { useState, useEffect, useRef, useCallback, useMemo,
+            useLayoutEffect, forwardRef, useImperativeHandle } = React;
+
+    // ---------------------------------------------------------------------------
+    //  constants.js
+    // ---------------------------------------------------------------------------
+    const EXPORT_WIDTH = 3840;          // 4K UHD
+    const EXPORT_HEIGHT = 2160;
+    const EXPORT_ASPECT = EXPORT_WIDTH / EXPORT_HEIGHT;
+    const PREVIEW_MAX_DIM = 1024;       // Editor-Vorschau (RAM-schonend)
+    const THUMB_MAX_DIM = 240;          // Seitenleiste
+    const MIN_IMAGES = 15;
+    const MAX_IMAGES = 25;
+    const SNAP_GRID = 32;
+    const SNAP_THRESHOLD = 8;
+    const DEFAULT_BG = '#0f172a';
+    const DEFAULT_SPACING = 0;
+
+    // ---------------------------------------------------------------------------
+    //  utils/imageProcessing.js
+    //  Wir behalten pro Bild zwei Repräsentationen:
+    //    - full   : Original (nur beim Export verwendet)
+    //    - preview: heruntergerechnet ~1024px (was Konva zeichnet)
+    //    - thumb  : ~240px für die Seitenleiste
+    //  Das ist der wichtigste Performance-Trick.
+    // ---------------------------------------------------------------------------
+    function loadImage(file) {
+      return new Promise((resolve, reject) => {
+        const url = URL.createObjectURL(file);
+        const img = new Image();
+        img.decoding = 'async';
+        img.onload = () => resolve({ img, url });
+        img.onerror = (e) => { URL.revokeObjectURL(url); reject(e); };
+        img.src = url;
+      });
+    }
+
+    async function downscale(srcImg, maxDim, quality = 0.85) {
+      const { naturalWidth: w, naturalHeight: h } = srcImg;
+      const longest = Math.max(w, h);
+      if (longest <= maxDim) return srcImg;
+      const scale = maxDim / longest;
+      const tw = Math.round(w * scale);
+      const th = Math.round(h * scale);
+      const canvas = document.createElement('canvas');
+      canvas.width = tw; canvas.height = th;
+      const ctx = canvas.getContext('2d');
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(srcImg, 0, 0, tw, th);
+      const blob = await new Promise((r) => canvas.toBlob(r, 'image/jpeg', quality));
+      const url = URL.createObjectURL(blob);
+      const out = new Image();
+      out.decoding = 'async';
+      await new Promise((res, rej) => { out.onload = res; out.onerror = rej; out.src = url; });
+      return out;
+    }
+
+    async function processFile(file) {
+      const { img: full } = await loadImage(file);
+      const [preview, thumb] = await Promise.all([
+        downscale(full, PREVIEW_MAX_DIM, 0.85),
+        downscale(full, THUMB_MAX_DIM, 0.7),
+      ]);
+      return {
+        id: (crypto.randomUUID ? crypto.randomUUID() : 'id-' + Math.random().toString(36).slice(2)),
+        name: file.name,
+        full, preview, thumb,
+        width: full.naturalWidth, height: full.naturalHeight,
+      };
+    }
+
+    // ---------------------------------------------------------------------------
+    //  utils/layouts.js
+    //  Layout-Funktion: (items, stageW, stageH, spacing) => placed[]
+    // ---------------------------------------------------------------------------
+    function fitCover(item, cw, ch) {
+      const ar = item.width / item.height;
+      const cellAr = cw / ch;
+      let w, h;
+      if (ar > cellAr) { h = ch; w = ch * ar; }
+      else { w = cw; h = cw / ar; }
+      return { width: w, height: h };
+    }
+
+    function gridLayout(items, stageW, stageH, spacing = 0) {
+      const n = items.length;
+      if (!n) return [];
+      let bestCols = 1, bestErr = Infinity;
+      for (let cols = 1; cols <= n; cols++) {
+        const rows = Math.ceil(n / cols);
+        const cellAr = (stageW / cols) / (stageH / rows);
+        const err = Math.abs(Math.log(cellAr / EXPORT_ASPECT));
+        if (err < bestErr) { bestErr = err; bestCols = cols; }
+      }
+      const cols = bestCols;
+      const rows = Math.ceil(n / cols);
+      const cw = stageW / cols;
+      const ch = stageH / rows;
+      return items.map((it, i) => {
+        const r = Math.floor(i / cols);
+        const c = i % cols;
+        const fit = fitCover(it, cw - spacing * 2, ch - spacing * 2);
+        return {
+          id: it.id,
+          x: c * cw + cw / 2,
+          y: r * ch + ch / 2,
+          width: fit.width, height: fit.height,
+          rotation: 0,
+        };
+      });
+    }
+
+    function mosaicLayout(items, stageW, stageH, spacing = 0) {
+      const n = items.length;
+      if (!n) return [];
+      if (n === 1) return gridLayout(items, stageW, stageH, spacing);
+      const heroW = stageW * 0.55;
+      const sideW = stageW - heroW;
+      const remaining = items.slice(1);
+      const sideCols = Math.max(1, Math.round(Math.sqrt(remaining.length * (sideW / stageH))));
+      const sideRows = Math.ceil(remaining.length / sideCols);
+      const cw = sideW / sideCols;
+      const ch = stageH / sideRows;
+      const placed = [];
+      const hero = items[0];
+      const heroFit = fitCover(hero, heroW - spacing * 2, stageH - spacing * 2);
+      placed.push({ id: hero.id, x: heroW / 2, y: stageH / 2,
+                    width: heroFit.width, height: heroFit.height, rotation: 0 });
+      remaining.forEach((it, i) => {
+        const r = Math.floor(i / sideCols);
+        const c = i % sideCols;
+        const fit = fitCover(it, cw - spacing * 2, ch - spacing * 2);
+        placed.push({ id: it.id,
+                      x: heroW + c * cw + cw / 2, y: r * ch + ch / 2,
+                      width: fit.width, height: fit.height, rotation: 0 });
+      });
+      return placed;
+    }
+
+    function scatterLayout(items, stageW, stageH) {
+      const n = items.length;
+      if (!n) return [];
+      const targetArea = (stageW * stageH * 0.95) / n;
+      return items.map((it) => {
+        const ar = it.width / it.height;
+        const h = Math.sqrt(targetArea / ar);
+        const w = h * ar;
+        return {
+          id: it.id,
+          x: Math.random() * (stageW - w) + w / 2,
+          y: Math.random() * (stageH - h) + h / 2,
+          width: w, height: h,
+          rotation: (Math.random() - 0.5) * 12,
+        };
+      });
+    }
+
+    const LAYOUTS = {
+      grid:    { label: 'Grid',    fn: gridLayout },
+      mosaic:  { label: 'Mosaic',  fn: mosaicLayout },
+      scatter: { label: 'Scatter', fn: scatterLayout },
+    };
+
+    // ---------------------------------------------------------------------------
+    //  utils/exportCanvas.js
+    //  Off-screen 4K-Render. Verwendet die Originale, nicht die Previews.
+    // ---------------------------------------------------------------------------
+    async function renderCollageBlob({
+      placed, itemsById, stageW, stageH, background,
+      mime = 'image/jpeg', quality = 0.92, onProgress = () => {},
+    }) {
+      const canvas = document.createElement('canvas');
+      canvas.width = EXPORT_WIDTH;
+      canvas.height = EXPORT_HEIGHT;
+      const ctx = canvas.getContext('2d');
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.fillStyle = background || '#000';
+      ctx.fillRect(0, 0, EXPORT_WIDTH, EXPORT_HEIGHT);
+      const sx = EXPORT_WIDTH / stageW;
+      const sy = EXPORT_HEIGHT / stageH;
+      for (let i = 0; i < placed.length; i++) {
+        const p = placed[i];
+        const item = itemsById.get(p.id);
+        if (!item) continue;
+        const cx = p.x * sx, cy = p.y * sy;
+        const w = p.width * sx, h = p.height * sy;
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.rotate(((p.rotation || 0) * Math.PI) / 180);
+        ctx.drawImage(item.full, -w / 2, -h / 2, w, h);
+        ctx.restore();
+        onProgress((i + 1) / placed.length);
+        // Yield damit der Progressbalken neu zeichnen kann.
+        await new Promise((r) => setTimeout(r, 0));
+      }
+      return await new Promise((resolve) => canvas.toBlob(resolve, mime, quality));
+    }
+
+    function downloadBlob(blob, filename) {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    // ---------------------------------------------------------------------------
+    //  hooks/useCollageStore.js
+    //  Mini-Store: ein Hook mit allem State + memoisierten Aktionen.
+    // ---------------------------------------------------------------------------
+    function useCollageStore() {
+      const [items, setItems] = useState([]);
+      const [placed, setPlaced] = useState([]);
+      const [background, setBackground] = useState(DEFAULT_BG);
+      const [spacing, setSpacing] = useState(DEFAULT_SPACING);
+      const [snap, setSnap] = useState(true);
+      const [selectedId, setSelectedId] = useState(null);
+
+      const itemsById = useMemo(() => new Map(items.map((i) => [i.id, i])), [items]);
+
+      const addItems = useCallback((ones) => setItems((prev) => [...prev, ...ones]), []);
+      const removeItem = useCallback((id) => {
+        setItems((prev) => prev.filter((i) => i.id !== id));
+        setPlaced((prev) => prev.filter((p) => p.id !== id));
+        setSelectedId((s) => (s === id ? null : s));
+      }, []);
+      const clearAll = useCallback(() => {
+        setItems([]); setPlaced([]); setSelectedId(null);
+      }, []);
+      const applyLayout = useCallback((name, sw, sh) => {
+        const fn = LAYOUTS[name]?.fn;
+        if (!fn) return;
+        setPlaced(fn(items, sw, sh, spacing));
+      }, [items, spacing]);
+      const updatePlaced = useCallback((id, patch) => {
+        setPlaced((prev) => prev.map((p) => (p.id === id ? { ...p, ...patch } : p)));
+      }, []);
+      const bringToFront = useCallback((id) => {
+        setPlaced((prev) => {
+          const idx = prev.findIndex((p) => p.id === id);
+          if (idx < 0 || idx === prev.length - 1) return prev;
+          const copy = prev.slice();
+          const [it] = copy.splice(idx, 1);
+          copy.push(it);
+          return copy;
+        });
+      }, []);
+
+      return {
+        items, placed, background, spacing, snap, selectedId, itemsById,
+        setBackground, setSpacing, setSnap, setSelectedId,
+        addItems, removeItem, clearAll, applyLayout, updatePlaced, bringToFront,
+      };
+    }
+
+    // ---------------------------------------------------------------------------
+    //  KonvaStage — imperativer Wrapper um Konva (statt react-konva).
+    //  In der Bundle-Version wird react-konva verwendet; im Single-File spart der
+    //  imperative Wrapper sich die UMD-Frage.
+    // ---------------------------------------------------------------------------
+    function KonvaStage({
+      width, height, background, placed, itemsById,
+      selectedId, onSelect, onUpdate, onBringToFront,
+      snap, showGrid,
+    }) {
+      const containerRef = useRef(null);
+      const stageRef = useRef(null);
+      const bgRectRef = useRef(null);
+      const gridLayerRef = useRef(null);
+      const layerRef = useRef(null);
+      const trRef = useRef(null);
+      const nodesRef = useRef(new Map()); // id -> Konva.Image
+
+      // Refs damit Event-Handler immer die aktuellen Callback-Werte sehen, ohne
+      // dass wir die Konva-Knoten neu binden müssen.
+      const onSelectRef = useRef(onSelect);
+      const onUpdateRef = useRef(onUpdate);
+      const onBringRef = useRef(onBringToFront);
+      const snapRef = useRef(snap);
+      useEffect(() => { onSelectRef.current = onSelect; }, [onSelect]);
+      useEffect(() => { onUpdateRef.current = onUpdate; }, [onUpdate]);
+      useEffect(() => { onBringRef.current = onBringToFront; }, [onBringToFront]);
+      useEffect(() => { snapRef.current = snap; }, [snap]);
+
+      // Stage einmalig erzeugen.
+      useEffect(() => {
+        const stage = new Konva.Stage({ container: containerRef.current, width, height });
+        const bgLayer = new Konva.Layer({ listening: true });
+        const bgRect = new Konva.Rect({ x: 0, y: 0, width, height, fill: background });
+        bgLayer.add(bgRect);
+        stage.add(bgLayer);
+
+        const gridLayer = new Konva.Layer({ listening: false });
+        stage.add(gridLayer);
+
+        const layer = new Konva.Layer();
+        stage.add(layer);
+
+        const tr = new Konva.Transformer({
+          keepRatio: true, rotateEnabled: true,
+          enabledAnchors: ['top-left', 'top-right', 'bottom-left', 'bottom-right'],
+          anchorStroke: '#5eead4', anchorFill: '#0b0d10', borderStroke: '#5eead4',
+          boundBoxFunc: (oldBox, newBox) =>
+            (newBox.width < 30 || newBox.height < 30) ? oldBox : newBox,
+        });
+        layer.add(tr);
+
+        // Klick auf leere Stage / Hintergrund => Auswahl aufheben.
+        const onStageDown = (e) => {
+          if (e.target === stage || e.target === bgRect) onSelectRef.current(null);
+        };
+        stage.on('mousedown touchstart', onStageDown);
+
+        stageRef.current = stage;
+        bgRectRef.current = bgRect;
+        gridLayerRef.current = gridLayer;
+        layerRef.current = layer;
+        trRef.current = tr;
+
+        return () => stage.destroy();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, []);
+
+      // Größe / Hintergrund nachziehen.
+      useEffect(() => {
+        const stage = stageRef.current; if (!stage) return;
+        stage.size({ width, height });
+        bgRectRef.current.size({ width, height });
+        bgRectRef.current.fill(background);
+        stage.batchDraw();
+      }, [width, height, background]);
+
+      // Grid neu zeichnen.
+      useEffect(() => {
+        const gl = gridLayerRef.current; if (!gl) return;
+        gl.destroyChildren();
+        if (showGrid) {
+          for (let x = SNAP_GRID; x < width; x += SNAP_GRID) {
+            gl.add(new Konva.Line({ points: [x, 0, x, height], stroke: '#ffffff', opacity: 0.05 }));
+          }
+          for (let y = SNAP_GRID; y < height; y += SNAP_GRID) {
+            gl.add(new Konva.Line({ points: [0, y, width, y], stroke: '#ffffff', opacity: 0.05 }));
+          }
+        }
+        gl.batchDraw();
+      }, [showGrid, width, height]);
+
+      // Bild-Knoten synchronisieren.
+      useEffect(() => {
+        const layer = layerRef.current; if (!layer) return;
+        const nodes = nodesRef.current;
+        const placedIds = new Set(placed.map((p) => p.id));
+
+        // Entfernte Knoten weg.
+        nodes.forEach((node, id) => {
+          if (!placedIds.has(id)) { node.destroy(); nodes.delete(id); }
+        });
+
+        // Hinzufügen / aktualisieren.
+        placed.forEach((p, i) => {
+          const item = itemsById.get(p.id);
+          if (!item) return;
+          let node = nodes.get(p.id);
+          if (!node) {
+            node = new Konva.Image({ image: item.preview, draggable: true });
+
+            node.on('mousedown touchstart', () => {
+              onSelectRef.current(p.id);
+              onBringRef.current(p.id);
+            });
+
+            node.on('dragend', () => {
+              let x = node.x(), y = node.y();
+              if (snapRef.current) {
+                const sv = (v) => {
+                  const nearest = Math.round(v / SNAP_GRID) * SNAP_GRID;
+                  return Math.abs(v - nearest) < SNAP_THRESHOLD ? nearest : v;
+                };
+                x = sv(x); y = sv(y);
+                node.position({ x, y });
+              }
+              onUpdateRef.current(node._tileId, { x, y });
+            });
+
+            node.on('transformend', () => {
+              const sx = node.scaleX(), sy = node.scaleY();
+              const w = Math.max(20, node.width() * sx);
+              const h = Math.max(20, node.height() * sy);
+              node.scaleX(1); node.scaleY(1);
+              node.size({ width: w, height: h });
+              node.offset({ x: w / 2, y: h / 2 });
+              onUpdateRef.current(node._tileId, {
+                x: node.x(), y: node.y(),
+                width: w, height: h, rotation: node.rotation(),
+              });
+            });
+
+            layer.add(node);
+            nodes.set(p.id, node);
+          }
+          node._tileId = p.id;
+          node.image(item.preview);
+          node.position({ x: p.x, y: p.y });
+          node.size({ width: p.width, height: p.height });
+          node.offset({ x: p.width / 2, y: p.height / 2 });
+          node.rotation(p.rotation || 0);
+          node.zIndex(i);
+        });
+
+        // Transformer immer ganz oben + an Auswahl heften.
+        const tr = trRef.current;
+        if (selectedId && nodes.has(selectedId)) {
+          tr.nodes([nodes.get(selectedId)]);
+        } else {
+          tr.nodes([]);
+        }
+        tr.moveToTop();
+
+        layer.batchDraw();
+      }, [placed, itemsById, selectedId]);
+
+      return <div ref={containerRef} />;
+    }
+
+    // ---------------------------------------------------------------------------
+    //  CollageEditor — sizing + KonvaStage + leere-Bühne-Hint
+    // ---------------------------------------------------------------------------
+    function CollageEditor(props) {
+      const wrapRef = useRef(null);
+      const [size, setSize] = useState({ w: 800, h: 450 });
+
+      useLayoutEffect(() => {
+        if (!wrapRef.current) return;
+        const ro = new ResizeObserver(([entry]) => {
+          const cw = entry.contentRect.width - 24;
+          const ch = entry.contentRect.height - 24;
+          if (cw <= 0 || ch <= 0) return;
+          let w = cw, h = w / EXPORT_ASPECT;
+          if (h > ch) { h = ch; w = h * EXPORT_ASPECT; }
+          setSize({ w: Math.floor(w), h: Math.floor(h) });
+        });
+        ro.observe(wrapRef.current);
+        return () => ro.disconnect();
+      }, []);
+
+      useEffect(() => { props.onStageSize?.(size.w, size.h); }, [size.w, size.h]);
+
+      return (
+        <div ref={wrapRef} className="flex h-full w-full items-center justify-center p-3">
+          <div
+            className="overflow-hidden rounded-lg shadow-soft"
+            style={{ width: size.w, height: size.h, background: props.background }}
+          >
+            <KonvaStage
+              width={size.w}
+              height={size.h}
+              background={props.background}
+              placed={props.placed}
+              itemsById={props.itemsById}
+              selectedId={props.selectedId}
+              onSelect={props.onSelect}
+              onUpdate={props.onUpdate}
+              onBringToFront={props.onBringToFront}
+              snap={props.snap}
+              showGrid={props.showGrid}
+            />
+          </div>
+        </div>
+      );
+    }
+
+    // ---------------------------------------------------------------------------
+    //  ImageUploader — verstecktes input + Drop-Zone-Wrapper.
+    // ---------------------------------------------------------------------------
+    const ImageUploader = forwardRef(function ImageUploader(
+      { onAdd, currentCount, children }, ref
+    ) {
+      const inputRef = useRef(null);
+      const [busy, setBusy] = useState(false);
+      const [dragOver, setDragOver] = useState(false);
+
+      useImperativeHandle(ref, () => ({ open: () => inputRef.current?.click() }));
+
+      const ingest = useCallback(async (fileList) => {
+        const files = Array.from(fileList).filter((f) => f.type.startsWith('image/'));
+        if (!files.length) return;
+        const room = Math.max(0, MAX_IMAGES - currentCount);
+        const slice = files.slice(0, room);
+        if (!slice.length) return;
+        setBusy(true);
+        try {
+          const records = await Promise.all(slice.map((f) => processFile(f)));
+          onAdd(records);
+        } finally {
+          setBusy(false);
+        }
+      }, [currentCount, onAdd]);
+
+      return (
+        <div
+          onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={(e) => { e.preventDefault(); setDragOver(false); ingest(e.dataTransfer.files); }}
+          className={'relative flex-1 ' + (dragOver ? 'drop-active' : '')}
+        >
+          <input
+            ref={inputRef} type="file" accept="image/*" multiple className="hidden"
+            onChange={(e) => { ingest(e.target.files); e.target.value = ''; }}
+          />
+          {children}
+          {busy && (
+            <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-ink-900/60">
+              <div className="rounded-md bg-ink-700 px-4 py-2 text-sm">Bilder werden verarbeitet…</div>
+            </div>
+          )}
+        </div>
+      );
+    });
+
+    // ---------------------------------------------------------------------------
+    //  ThumbnailPanel
+    // ---------------------------------------------------------------------------
+    function ThumbnailPanel({ items, selectedId, onSelect, onRemove }) {
+      if (!items.length) {
+        return (
+          <aside className="hidden w-64 shrink-0 border-r border-ink-700 bg-ink-800 p-4 text-sm text-slate-400 lg:block">
+            <p className="mb-2 font-medium text-slate-200">Noch keine Bilder</p>
+            <p>Fotos auf die Bühne ziehen oder oben auf <span className="text-accent">Bilder hochladen</span> klicken.</p>
+          </aside>
+        );
+      }
+      return (
+        <aside className="scroll-thin hidden w-64 shrink-0 overflow-y-auto border-r border-ink-700 bg-ink-800 p-3 lg:block">
+          <p className="mb-3 text-xs uppercase tracking-wide text-slate-400">Fotos · {items.length}</p>
+          <ul className="grid grid-cols-2 gap-2">
+            {items.map((it) => {
+              const active = selectedId === it.id;
+              return (
+                <li key={it.id} className="group relative">
+                  <button
+                    type="button"
+                    onClick={() => onSelect(it.id)}
+                    className={'block w-full overflow-hidden rounded-md border ' +
+                      (active ? 'border-accent ring-2 ring-accent/40'
+                              : 'border-ink-600 hover:border-slate-400')}
+                    title={it.name}
+                  >
+                    <img src={it.thumb.src} alt={it.name}
+                         className="aspect-square h-auto w-full object-cover" loading="lazy" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onRemove(it.id)}
+                    className="absolute right-1 top-1 hidden h-6 w-6 items-center justify-center rounded-full bg-ink-900/80 text-slate-200 hover:bg-rose-500 hover:text-white group-hover:flex"
+                    title="Entfernen"
+                  >×</button>
+                </li>
+              );
+            })}
+          </ul>
+        </aside>
+      );
+    }
+
+    // ---------------------------------------------------------------------------
+    //  Toolbar
+    // ---------------------------------------------------------------------------
+    function Toolbar({ count, onUploadClick, onApplyLayout, onReset, onExportJpeg, onExportPng, exporting }) {
+      const canExport = count >= 1 && !exporting;
+      return (
+        <header className="flex flex-wrap items-center gap-2 border-b border-ink-700 bg-ink-800 px-4 py-3 shadow-soft">
+          <div className="flex items-center gap-2">
+            <span className="text-accent text-lg font-semibold tracking-tight">Collage Studio</span>
+            <span className="hidden text-xs text-slate-400 sm:inline">4K Export</span>
+          </div>
+          <div className="ml-auto flex flex-wrap items-center gap-2">
+            <button onClick={onUploadClick}
+              className="rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-ink-900 hover:bg-accent-soft">
+              Bilder hochladen
+            </button>
+            <div className="flex items-center gap-1 rounded-md bg-ink-700 p-1">
+              {Object.entries(LAYOUTS).map(([key, { label }]) => (
+                <button key={key} onClick={() => onApplyLayout(key)} disabled={count === 0}
+                  className="rounded px-2 py-1 text-xs text-slate-200 hover:bg-ink-600 disabled:opacity-40"
+                  title={`Layout ${label}`}>{label}</button>
+              ))}
+            </div>
+            <button onClick={onReset} disabled={count === 0}
+              className="rounded-md border border-ink-600 px-3 py-1.5 text-sm hover:bg-ink-700 disabled:opacity-40">
+              Reset
+            </button>
+            <div className="flex overflow-hidden rounded-md">
+              <button onClick={onExportJpeg} disabled={!canExport}
+                className="bg-emerald-500 px-3 py-1.5 text-sm font-medium text-ink-900 hover:bg-emerald-400 disabled:opacity-40">
+                JPEG (4K)
+              </button>
+              <button onClick={onExportPng} disabled={!canExport}
+                className="border-l border-emerald-700 bg-emerald-500 px-3 py-1.5 text-sm font-medium text-ink-900 hover:bg-emerald-400 disabled:opacity-40">
+                PNG
+              </button>
+            </div>
+            <span className={'ml-2 text-xs ' +
+              (count < MIN_IMAGES || count > MAX_IMAGES ? 'text-amber-400' : 'text-slate-400')}
+              title={`Empfohlen: ${MIN_IMAGES}–${MAX_IMAGES} Bilder`}>
+              {count} / {MIN_IMAGES}–{MAX_IMAGES}
+            </span>
+          </div>
+        </header>
+      );
+    }
+
+    // ---------------------------------------------------------------------------
+    //  SettingsPanel
+    // ---------------------------------------------------------------------------
+    function SettingsPanel({ background, onBackground, spacing, onSpacing, snap, onSnap, showGrid, onShowGrid }) {
+      return (
+        <div className="pointer-events-auto absolute bottom-3 left-3 flex flex-wrap items-center gap-3 rounded-md border border-ink-700 bg-ink-800/90 px-3 py-2 text-xs shadow-soft backdrop-blur">
+          <label className="flex items-center gap-2">
+            <span className="text-slate-300">Hintergrund</span>
+            <input type="color" value={background} onChange={(e) => onBackground(e.target.value)}
+              className="h-6 w-8 cursor-pointer rounded border border-ink-600 bg-transparent" />
+          </label>
+          <label className="flex items-center gap-2">
+            <span className="text-slate-300">Abstand</span>
+            <input type="range" min={0} max={40} value={spacing}
+              onChange={(e) => onSpacing(Number(e.target.value))}
+              className="w-28 accent-accent" />
+            <span className="w-6 text-right tabular-nums text-slate-400">{spacing}</span>
+          </label>
+          <label className="flex items-center gap-2">
+            <input type="checkbox" checked={snap} onChange={(e) => onSnap(e.target.checked)} className="accent-accent" />
+            <span className="text-slate-300">Raster-Snap</span>
+          </label>
+          <label className="flex items-center gap-2">
+            <input type="checkbox" checked={showGrid} onChange={(e) => onShowGrid(e.target.checked)} className="accent-accent" />
+            <span className="text-slate-300">Raster anzeigen</span>
+          </label>
+        </div>
+      );
+    }
+
+    // ---------------------------------------------------------------------------
+    //  ExportProgress
+    // ---------------------------------------------------------------------------
+    function ExportProgress({ active, progress, label }) {
+      if (!active) return null;
+      const pct = Math.round((progress || 0) * 100);
+      return (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-ink-900/70 backdrop-blur-sm">
+          <div className="w-72 rounded-lg border border-ink-700 bg-ink-800 p-5 shadow-soft">
+            <div className="mb-2 text-sm text-slate-200">{label || 'Exportiere…'}</div>
+            <div className="h-2 w-full overflow-hidden rounded bg-ink-700">
+              <div className="h-full bg-accent transition-[width] duration-150" style={{ width: pct + '%' }} />
+            </div>
+            <div className="mt-2 text-right text-xs text-slate-400 tabular-nums">{pct}%</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ---------------------------------------------------------------------------
+    //  App — Wurzelkomponente
+    // ---------------------------------------------------------------------------
+    function App() {
+      const store = useCollageStore();
+      const uploaderRef = useRef(null);
+      const [stageSize, setStageSize] = useState({ w: 1280, h: 720 });
+      const onStageSize = useCallback((w, h) => setStageSize({ w, h }), []);
+      const [showGrid, setShowGrid] = useState(false);
+
+      const [exporting, setExporting] = useState(false);
+      const [exportProgress, setExportProgress] = useState(0);
+      const [exportLabel, setExportLabel] = useState('');
+
+      // Auto-Grid bei Bildänderungen.
+      const itemCount = store.items.length;
+      useEffect(() => {
+        if (itemCount === 0) return;
+        store.applyLayout('grid', stageSize.w, stageSize.h);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [itemCount]);
+
+      // Spacing-Änderung => Grid neu rechnen.
+      useEffect(() => {
+        if (!store.items.length) return;
+        store.applyLayout('grid', stageSize.w, stageSize.h);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [store.spacing]);
+
+      const handleAdd = useCallback((records) => store.addItems(records), [store]);
+      const onApplyLayout = (name) => store.applyLayout(name, stageSize.w, stageSize.h);
+      const onReset = () => store.applyLayout('grid', stageSize.w, stageSize.h);
+
+      const doExport = async (mime, ext, quality) => {
+        if (!store.placed.length) return;
+        setExporting(true);
+        setExportProgress(0);
+        setExportLabel(`4K-${ext.toUpperCase()} wird gerendert…`);
+        try {
+          const blob = await renderCollageBlob({
+            placed: store.placed, itemsById: store.itemsById,
+            stageW: stageSize.w, stageH: stageSize.h,
+            background: store.background,
+            mime, quality,
+            onProgress: setExportProgress,
+          });
+          if (blob) downloadBlob(blob, `collage-4k-${Date.now()}.${ext}`);
+        } finally {
+          setExporting(false);
+        }
+      };
+
+      return (
+        <div className="flex h-screen flex-col">
+          <Toolbar
+            count={store.items.length}
+            onUploadClick={() => uploaderRef.current?.open()}
+            onApplyLayout={onApplyLayout}
+            onReset={onReset}
+            onExportJpeg={() => doExport('image/jpeg', 'jpg', 0.92)}
+            onExportPng={() => doExport('image/png', 'png')}
+            exporting={exporting}
+          />
+          <div className="relative flex flex-1 overflow-hidden">
+            <ThumbnailPanel
+              items={store.items}
+              selectedId={store.selectedId}
+              onSelect={store.setSelectedId}
+              onRemove={store.removeItem}
+            />
+            <ImageUploader ref={uploaderRef} onAdd={handleAdd} currentCount={store.items.length}>
+              <CollageEditor
+                items={store.items}
+                itemsById={store.itemsById}
+                placed={store.placed}
+                selectedId={store.selectedId}
+                onSelect={store.setSelectedId}
+                onUpdate={store.updatePlaced}
+                onBringToFront={store.bringToFront}
+                background={store.background}
+                snap={store.snap}
+                showGrid={showGrid}
+                onStageSize={onStageSize}
+              />
+              <SettingsPanel
+                background={store.background}
+                onBackground={store.setBackground}
+                spacing={store.spacing}
+                onSpacing={store.setSpacing}
+                snap={store.snap}
+                onSnap={store.setSnap}
+                showGrid={showGrid}
+                onShowGrid={setShowGrid}
+              />
+              {store.items.length === 0 && (
+                <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+                  <div className="rounded-lg border border-dashed border-ink-600 bg-ink-800/60 px-6 py-5 text-center text-slate-300">
+                    <p className="text-base font-medium">15–25 Fotos hier ablegen</p>
+                    <p className="mt-1 text-sm text-slate-400">oder oben auf „Bilder hochladen"</p>
+                  </div>
+                </div>
+              )}
+              <ExportProgress active={exporting} progress={exportProgress} label={exportLabel} />
+            </ImageUploader>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    </script>
+  </body>
+</html>
