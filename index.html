@@ -124,12 +124,16 @@
     //  utils/layouts.js
     //  Layout-Funktion: (items, stageW, stageH, spacing) => placed[]
     // ---------------------------------------------------------------------------
-    function fitCover(item, cw, ch) {
+
+    // "contain": Bild passt INNEN in die Zelle, ggf. kleiner Letterbox.
+    // Wir verwenden bewusst nicht "cover", weil das bei abweichendem
+    // Seitenverhältnis in die Nachbarzelle ragen würde.
+    function fitContain(item, cw, ch) {
       const ar = item.width / item.height;
       const cellAr = cw / ch;
       let w, h;
-      if (ar > cellAr) { h = ch; w = ch * ar; }
-      else { w = cw; h = cw / ar; }
+      if (ar > cellAr) { w = cw; h = cw / ar; }
+      else            { h = ch; w = ch * ar; }
       return { width: w, height: h };
     }
 
@@ -150,7 +154,7 @@
       return items.map((it, i) => {
         const r = Math.floor(i / cols);
         const c = i % cols;
-        const fit = fitCover(it, cw - spacing * 2, ch - spacing * 2);
+        const fit = fitContain(it, cw - spacing * 2, ch - spacing * 2);
         return {
           id: it.id,
           x: c * cw + cw / 2,
@@ -161,29 +165,71 @@
       });
     }
 
+    // Justified-rows Mosaic ("Flickr"-Stil).
+    // Zeilen mit identischer Höhe pro Zeile, Breite füllt die Bühne exakt.
+    // Tiles haben unterschiedliche Breiten je nach Foto-Seitenverhältnis,
+    // alle behalten ihr natürliches Verhältnis, NICHTS überlappt.
     function mosaicLayout(items, stageW, stageH, spacing = 0) {
       const n = items.length;
       if (!n) return [];
       if (n === 1) return gridLayout(items, stageW, stageH, spacing);
-      const heroW = stageW * 0.55;
-      const sideW = stageW - heroW;
-      const remaining = items.slice(1);
-      const sideCols = Math.max(1, Math.round(Math.sqrt(remaining.length * (sideW / stageH))));
-      const sideRows = Math.ceil(remaining.length / sideCols);
-      const cw = sideW / sideCols;
-      const ch = stageH / sideRows;
+
+      const aspects = items.map((it) => it.width / it.height);
+      const totalAspect = aspects.reduce((s, a) => s + a, 0);
+
+      const stageAspect = stageW / stageH;
+      let rowCount = Math.max(1, Math.round(Math.sqrt(totalAspect / stageAspect)));
+      rowCount = Math.min(rowCount, n);
+
+      // Greedy in Zeilen aufteilen — Reihenfolge bleibt erhalten.
+      const targetRowAspect = totalAspect / rowCount;
+      const rows = [[]];
+      let curAspect = 0;
+      for (let i = 0; i < n; i++) {
+        const remainingItems = n - i;
+        const remainingRows = rowCount - (rows.length - 1);
+        rows[rows.length - 1].push(items[i]);
+        curAspect += aspects[i];
+        const shouldClose =
+          rows.length < rowCount &&
+          (curAspect >= targetRowAspect || remainingItems <= remainingRows);
+        if (shouldClose && i < n - 1) {
+          rows.push([]);
+          curAspect = 0;
+        }
+      }
+
+      // Pro Zeile: Höhe so, dass Summe der Breiten = stageW.
+      const rowHeights = rows.map((row) => {
+        const aSum = row.reduce((s, it) => s + it.width / it.height, 0);
+        const gaps = spacing * (row.length - 1);
+        return Math.max(1, (stageW - gaps) / aSum);
+      });
+
+      // Gesamthöhe natürlich → uniform skalieren bis Stage-Höhe erreicht.
+      const naturalH = rowHeights.reduce((s, h) => s + h, 0) + spacing * (rows.length - 1);
+      const scale = naturalH > 0 ? stageH / naturalH : 1;
+      const finalW = stageW * scale;
+      const offsetX = (stageW - finalW) / 2;
+
       const placed = [];
-      const hero = items[0];
-      const heroFit = fitCover(hero, heroW - spacing * 2, stageH - spacing * 2);
-      placed.push({ id: hero.id, x: heroW / 2, y: stageH / 2,
-                    width: heroFit.width, height: heroFit.height, rotation: 0 });
-      remaining.forEach((it, i) => {
-        const r = Math.floor(i / sideCols);
-        const c = i % sideCols;
-        const fit = fitCover(it, cw - spacing * 2, ch - spacing * 2);
-        placed.push({ id: it.id,
-                      x: heroW + c * cw + cw / 2, y: r * ch + ch / 2,
-                      width: fit.width, height: fit.height, rotation: 0 });
+      let y = 0;
+      rows.forEach((row, ri) => {
+        const rowH = rowHeights[ri] * scale;
+        let x = offsetX;
+        row.forEach((it) => {
+          const w = (it.width / it.height) * rowH;
+          placed.push({
+            id: it.id,
+            x: x + w / 2,
+            y: y + rowH / 2,
+            width: w,
+            height: rowH,
+            rotation: 0,
+          });
+          x += w + spacing * scale;
+        });
+        y += rowH + spacing * scale;
       });
       return placed;
     }
