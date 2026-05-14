@@ -1,12 +1,1336 @@
 <!doctype html>
-<html lang="en">
+<html lang="de">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Collage Studio — 4K Photo Collage Editor</title>
+
+    <!-- Tailwind Play CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              ink: { 900: '#0b0d10', 800: '#12161b', 700: '#1a2029', 600: '#252d39' },
+              accent: { DEFAULT: '#5eead4', soft: '#2dd4bf' },
+            },
+            boxShadow: { soft: '0 6px 24px -8px rgba(0,0,0,0.45)' },
+          },
+        },
+      };
+    </script>
+
+    <!-- React + Konva (UMD) -->
+    <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/konva@9.3.16/konva.min.js"></script>
+
+    <!-- Babel standalone: kompiliert JSX im Browser. Reicht für ein Single-File-Demo,
+         für richtige Builds würde man stattdessen Vite verwenden. -->
+    <script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+
+    <style>
+      html, body, #root { height: 100%; }
+      body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+      .scroll-thin::-webkit-scrollbar { width: 8px; height: 8px; }
+      .scroll-thin::-webkit-scrollbar-thumb { background: #2a3340; border-radius: 4px; }
+      .scroll-thin::-webkit-scrollbar-thumb:hover { background: #3b4658; }
+      .drop-active { outline: 2px dashed #5eead4; outline-offset: -8px; background: rgba(94,234,212,0.05); }
+    </style>
   </head>
   <body class="bg-ink-900 text-slate-100">
     <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
+
+    <script type="text/babel" data-presets="env,react">
+    // ============================================================================
+    //  Collage Studio — Single-File-Version
+    //  Alle Logik in einer Datei, da kein Build-Schritt vorhanden ist.
+    //  Modulare Aufteilung wie im npm-Projekt: constants → utils → store → komponenten.
+    // ============================================================================
+
+    const { useState, useEffect, useRef, useCallback, useMemo,
+            useLayoutEffect, forwardRef, useImperativeHandle } = React;
+
+    // ---------------------------------------------------------------------------
+    //  constants.js
+    // ---------------------------------------------------------------------------
+    const EXPORT_WIDTH = 3840;          // 4K UHD
+    const EXPORT_HEIGHT = 2160;
+    const EXPORT_ASPECT = EXPORT_WIDTH / EXPORT_HEIGHT;
+    const PREVIEW_MAX_DIM = 1024;       // Editor-Vorschau (RAM-schonend)
+    const THUMB_MAX_DIM = 240;          // Seitenleiste
+    const MIN_IMAGES = 15;
+    const MAX_IMAGES = 25;
+    const SNAP_GRID = 32;
+    const SNAP_THRESHOLD = 8;
+    const DEFAULT_BG = '#0f172a';
+    const DEFAULT_SPACING = 0;
+
+    // ---------------------------------------------------------------------------
+    //  utils/imageProcessing.js
+    //  Wir behalten pro Bild zwei Repräsentationen:
+    //    - full   : Original (nur beim Export verwendet)
+    //    - preview: heruntergerechnet ~1024px (was Konva zeichnet)
+    //    - thumb  : ~240px für die Seitenleiste
+    //  Das ist der wichtigste Performance-Trick.
+    // ---------------------------------------------------------------------------
+    function loadImage(file) {
+      return new Promise((resolve, reject) => {
+        const url = URL.createObjectURL(file);
+        const img = new Image();
+        img.decoding = 'async';
+        img.onload = () => resolve({ img, url });
+        img.onerror = (e) => { URL.revokeObjectURL(url); reject(e); };
+        img.src = url;
+      });
+    }
+
+    async function downscale(srcImg, maxDim, quality = 0.85) {
+      const { naturalWidth: w, naturalHeight: h } = srcImg;
+      const longest = Math.max(w, h);
+      if (longest <= maxDim) return srcImg;
+      const scale = maxDim / longest;
+      const tw = Math.round(w * scale);
+      const th = Math.round(h * scale);
+      const canvas = document.createElement('canvas');
+      canvas.width = tw; canvas.height = th;
+      const ctx = canvas.getContext('2d');
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(srcImg, 0, 0, tw, th);
+      const blob = await new Promise((r) => canvas.toBlob(r, 'image/jpeg', quality));
+      const url = URL.createObjectURL(blob);
+      const out = new Image();
+      out.decoding = 'async';
+      await new Promise((res, rej) => { out.onload = res; out.onerror = rej; out.src = url; });
+      return out;
+    }
+
+    async function processFile(file) {
+      const { img: full } = await loadImage(file);
+      const [preview, thumb] = await Promise.all([
+        downscale(full, PREVIEW_MAX_DIM, 0.85),
+        downscale(full, THUMB_MAX_DIM, 0.7),
+      ]);
+      return {
+        id: (crypto.randomUUID ? crypto.randomUUID() : 'id-' + Math.random().toString(36).slice(2)),
+        name: file.name,
+        full, preview, thumb,
+        width: full.naturalWidth, height: full.naturalHeight,
+      };
+    }
+
+    // ---------------------------------------------------------------------------
+    //  utils/layouts.js
+    //  Layout-Funktion: (items, stageW, stageH, spacing) => placed[]
+    // ---------------------------------------------------------------------------
+
+    // Fisher-Yates Shuffle — neues Array, Original bleibt unverändert.
+    function shuffled(arr) {
+      const a = arr.slice();
+      for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+      }
+      return a;
+    }
+
+    // "contain": Bild passt INNEN in die Zelle, ggf. kleiner Letterbox.
+    // Wir verwenden bewusst nicht "cover", weil das bei abweichendem
+    // Seitenverhältnis in die Nachbarzelle ragen würde.
+    function fitContain(item, cw, ch) {
+      const ar = item.width / item.height;
+      const cellAr = cw / ch;
+      let w, h;
+      if (ar > cellAr) { w = cw; h = cw / ar; }
+      else            { h = ch; w = ch * ar; }
+      return { width: w, height: h };
+    }
+
+    function gridLayout(items, stageW, stageH, spacing = 0) {
+      const n = items.length;
+      if (!n) return [];
+      let bestCols = 1, bestErr = Infinity;
+      for (let cols = 1; cols <= n; cols++) {
+        const rows = Math.ceil(n / cols);
+        const cellAr = (stageW / cols) / (stageH / rows);
+        const err = Math.abs(Math.log(cellAr / EXPORT_ASPECT));
+        if (err < bestErr) { bestErr = err; bestCols = cols; }
+      }
+      const cols = bestCols;
+      const rows = Math.ceil(n / cols);
+      const cw = stageW / cols;
+      const ch = stageH / rows;
+      return items.map((it, i) => {
+        const r = Math.floor(i / cols);
+        const c = i % cols;
+        const fit = fitContain(it, cw - spacing * 2, ch - spacing * 2);
+        return {
+          id: it.id,
+          x: c * cw + cw / 2,
+          y: r * ch + ch / 2,
+          width: fit.width, height: fit.height,
+          rotation: 0,
+        };
+      });
+    }
+
+    // ROWS — Justified-rows ("Flickr"-Stil), füllt die Bühne komplett.
+    // 1) Alle Zeilenanzahlen 1..n durchprobieren, jeweils greedy nach
+    //    Aspect-Summe partitionieren, Zeilenhöhen so wählen dass Breite=stageW.
+    //    Score = wie nah die natürliche Gesamthöhe an stageH liegt.
+    // 2) Beste Aufteilung nehmen und nur vertikal nachskalieren.
+    function rowsLayout(items, stageW, stageH, spacing = 0) {
+      const n = items.length;
+      if (!n) return [];
+      if (n === 1) return gridLayout(items, stageW, stageH, spacing);
+
+      items = shuffled(items);
+      const aspects = items.map((it) => it.width / it.height);
+      const totalAspect = aspects.reduce((s, a) => s + a, 0);
+
+      const partition = (k) => {
+        const target = totalAspect / k;
+        const rows = [[]];
+        let cur = 0;
+        for (let i = 0; i < n; i++) {
+          const remainItems = n - i;
+          const remainRows = k - (rows.length - 1);
+          rows[rows.length - 1].push(i);
+          cur += aspects[i];
+          const close = rows.length < k && (cur >= target || remainItems <= remainRows);
+          if (close && i < n - 1) { rows.push([]); cur = 0; }
+        }
+        return rows;
+      };
+
+      const measure = (rows) => {
+        let totalH = spacing * (rows.length - 1);
+        const heights = rows.map((row) => {
+          const aSum = row.reduce((s, idx) => s + aspects[idx], 0);
+          const gaps = spacing * (row.length - 1);
+          const h = Math.max(1, (stageW - gaps) / aSum);
+          totalH += h;
+          return h;
+        });
+        return { totalH, heights };
+      };
+
+      let bestRows = null, bestHeights = null, bestErr = Infinity;
+      for (let k = 1; k <= n; k++) {
+        const rows = partition(k);
+        const { totalH, heights } = measure(rows);
+        const err = Math.abs(Math.log(totalH / stageH));
+        if (err < bestErr) { bestErr = err; bestRows = rows; bestHeights = heights; }
+      }
+
+      const naturalH =
+        bestHeights.reduce((s, h) => s + h, 0) + spacing * (bestRows.length - 1);
+      const yScale = naturalH > 0 ? stageH / naturalH : 1;
+
+      const placed = [];
+      let y = 0;
+      bestRows.forEach((row, ri) => {
+        const rowH = bestHeights[ri] * yScale;
+        let x = 0;
+        row.forEach((idx) => {
+          const w = aspects[idx] * bestHeights[ri];
+          placed.push({
+            id: items[idx].id,
+            x: x + w / 2,
+            y: y + rowH / 2,
+            width: w, height: rowH,
+            rotation: 0,
+          });
+          x += w + spacing;
+        });
+        y += rowH + spacing;
+      });
+      return placed;
+    }
+
+    // COLS — gleiches Prinzip wie Rows, nur dass Fotos in Spalten gestapelt
+    // werden. Spaltenbreite füllt stageH exakt; horizontale Skalierung sorgt
+    // dafür dass die Spalten zusammen stageW füllen.
+    function colsLayout(items, stageW, stageH, spacing = 0) {
+      const n = items.length;
+      if (!n) return [];
+      if (n === 1) return gridLayout(items, stageW, stageH, spacing);
+
+      items = shuffled(items);
+      const inv = items.map((it) => it.height / it.width);   // h/w
+      const totalInv = inv.reduce((s, a) => s + a, 0);
+
+      const partition = (k) => {
+        const target = totalInv / k;
+        const cols = [[]];
+        let cur = 0;
+        for (let i = 0; i < n; i++) {
+          const remainItems = n - i;
+          const remainCols = k - (cols.length - 1);
+          cols[cols.length - 1].push(i);
+          cur += inv[i];
+          const close = cols.length < k && (cur >= target || remainItems <= remainCols);
+          if (close && i < n - 1) { cols.push([]); cur = 0; }
+        }
+        return cols;
+      };
+
+      const measure = (cols) => {
+        let totalW = spacing * (cols.length - 1);
+        const widths = cols.map((col) => {
+          const invSum = col.reduce((s, idx) => s + inv[idx], 0);
+          const gaps = spacing * (col.length - 1);
+          const w = Math.max(1, (stageH - gaps) / invSum);
+          totalW += w;
+          return w;
+        });
+        return { totalW, widths };
+      };
+
+      let bestCols = null, bestWidths = null, bestErr = Infinity;
+      for (let k = 1; k <= n; k++) {
+        const cols = partition(k);
+        const { totalW, widths } = measure(cols);
+        const err = Math.abs(Math.log(totalW / stageW));
+        if (err < bestErr) { bestErr = err; bestCols = cols; bestWidths = widths; }
+      }
+
+      const naturalW =
+        bestWidths.reduce((s, w) => s + w, 0) + spacing * (bestCols.length - 1);
+      const xScale = naturalW > 0 ? stageW / naturalW : 1;
+
+      const placed = [];
+      let x = 0;
+      bestCols.forEach((col, ci) => {
+        const colW = bestWidths[ci] * xScale;
+        let y = 0;
+        col.forEach((idx) => {
+          const h = inv[idx] * bestWidths[ci];
+          placed.push({
+            id: items[idx].id,
+            x: x + colW / 2,
+            y: y + h / 2,
+            width: colW, height: h,
+            rotation: 0,
+          });
+          y += h + spacing;
+        });
+        x += colW + spacing;
+      });
+      return placed;
+    }
+
+    // QUILT (Patchwork) — rekursive Binär-Partition.
+    // Stage wird in n Rechtecke zerlegt. Um Bildverzerrung gering zu halten:
+    //  1. BSP schneidet IMMER entlang der längeren Seite, mit ausgewogenen
+    //     Count-Splits und gebundenem Ratio (0.35..0.65) — verhindert
+    //     extreme Streifen.
+    //  2. Mehrere BSP-Versuche werden generiert; wir wählen den aus, dessen
+    //     sortierte Leaf-Aspects am besten zur sortierten Foto-Aspect-Reihe
+    //     passen. Anschließend index-paarweise zuordnen.
+    function quiltLayout(items, stageW, stageH, spacing = 0) {
+      const n = items.length;
+      if (!n) return [];
+      if (n === 1) return gridLayout(items, stageW, stageH, spacing);
+
+      const bsp = (rect, count) => {
+        if (count === 1) return [rect];
+        // Immer entlang der längeren Seite schneiden.
+        const splitV = rect.w >= rect.h;
+        const half = count / 2;
+        const leftCount = Math.max(
+          1,
+          Math.min(count - 1, Math.random() < 0.5 ? Math.floor(half) : Math.ceil(half)),
+        );
+        const rightCount = count - leftCount;
+        const target = leftCount / count;
+        const jitter = (Math.random() - 0.5) * 0.15;
+        const ratio = Math.max(0.35, Math.min(0.65, target + jitter));
+        if (splitV) {
+          const w1 = rect.w * ratio;
+          return [
+            ...bsp({ x: rect.x,      y: rect.y, w: w1,          h: rect.h }, leftCount),
+            ...bsp({ x: rect.x + w1, y: rect.y, w: rect.w - w1, h: rect.h }, rightCount),
+          ];
+        }
+        const h1 = rect.h * ratio;
+        return [
+          ...bsp({ x: rect.x, y: rect.y,      w: rect.w, h: h1          }, leftCount),
+          ...bsp({ x: rect.x, y: rect.y + h1, w: rect.w, h: rect.h - h1 }, rightCount),
+        ];
+      };
+
+      const sh = shuffled(items);
+      const sortedItemArs = sh
+        .map((it) => it.width / it.height)
+        .slice()
+        .sort((a, b) => a - b);
+
+      // Mehrere BSPs samplen; Score = Summe |log(item_ar/leaf_ar)|.
+      let leaves = null;
+      let bestScore = Infinity;
+      for (let attempt = 0; attempt < 24; attempt++) {
+        const candidate = bsp({ x: 0, y: 0, w: stageW, h: stageH }, n);
+        const leafArs = candidate.map((lf) => lf.w / lf.h).sort((a, b) => a - b);
+        let score = 0;
+        for (let i = 0; i < n; i++) {
+          score += Math.abs(Math.log(sortedItemArs[i] / leafArs[i]));
+        }
+        if (score < bestScore) {
+          bestScore = score;
+          leaves = candidate;
+        }
+      }
+
+      const itemOrder = sh
+        .map((it, i) => ({ i, ar: it.width / it.height }))
+        .sort((a, b) => a.ar - b.ar);
+      const leafOrder = leaves
+        .map((lf, i) => ({ i, ar: lf.w / lf.h }))
+        .sort((a, b) => a.ar - b.ar);
+
+      const placed = new Array(n);
+      for (let k = 0; k < n; k++) {
+        const it = sh[itemOrder[k].i];
+        const lf = leaves[leafOrder[k].i];
+        const inset = Math.min(spacing, lf.w * 0.45, lf.h * 0.45);
+        placed[k] = {
+          id: it.id,
+          x: lf.x + lf.w / 2,
+          y: lf.y + lf.h / 2,
+          width: lf.w - inset,
+          height: lf.h - inset,
+          rotation: 0,
+        };
+      }
+      return placed;
+    }
+
+    function scatterLayout(items, stageW, stageH) {
+      const n = items.length;
+      if (!n) return [];
+      const targetArea = (stageW * stageH * 0.95) / n;
+      return items.map((it) => {
+        const ar = it.width / it.height;
+        const h = Math.sqrt(targetArea / ar);
+        const w = h * ar;
+        return {
+          id: it.id,
+          x: Math.random() * (stageW - w) + w / 2,
+          y: Math.random() * (stageH - h) + h / 2,
+          width: w, height: h,
+          rotation: (Math.random() - 0.5) * 12,
+        };
+      });
+    }
+
+    const LAYOUTS = {
+      grid:    { label: 'Grid',    fn: gridLayout },
+      rows:    { label: 'Rows',    fn: rowsLayout },
+      cols:    { label: 'Cols',    fn: colsLayout },
+      quilt:   { label: 'Quilt',   fn: quiltLayout },
+      scatter: { label: 'Scatter', fn: scatterLayout },
+    };
+
+    // ---------------------------------------------------------------------------
+    //  utils/exportCanvas.js
+    //  Off-screen 4K-Render. Verwendet die Originale, nicht die Previews.
+    // ---------------------------------------------------------------------------
+    async function renderCollageBlob({
+      placed, itemsById, stageW, stageH, background,
+      mime = 'image/jpeg', quality = 0.92, onProgress = () => {},
+    }) {
+      const canvas = document.createElement('canvas');
+      canvas.width = EXPORT_WIDTH;
+      canvas.height = EXPORT_HEIGHT;
+      const ctx = canvas.getContext('2d');
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.fillStyle = background || '#000';
+      ctx.fillRect(0, 0, EXPORT_WIDTH, EXPORT_HEIGHT);
+      const sx = EXPORT_WIDTH / stageW;
+      const sy = EXPORT_HEIGHT / stageH;
+      for (let i = 0; i < placed.length; i++) {
+        const p = placed[i];
+        const item = itemsById.get(p.id);
+        if (!item) continue;
+        const cx = p.x * sx, cy = p.y * sy;
+        const w = p.width * sx, h = p.height * sy;
+        // Cover-Fit auf das Original mit pro-Kachel-Zoom.
+        const img = item.full;
+        const nw = img.naturalWidth || img.width;
+        const nh = img.naturalHeight || img.height;
+        const arImg = nw / nh, arTile = p.width / p.height;
+        let cropW0, cropH0;
+        if (arImg > arTile) { cropH0 = nh; cropW0 = cropH0 * arTile; }
+        else                { cropW0 = nw; cropH0 = cropW0 / arTile; }
+        const zoom = Math.max(1, Math.min(10, p.cropZoom ?? 1));
+        const cropW = cropW0 / zoom;
+        const cropH = cropH0 / zoom;
+        const cxN = p.cropCx ?? 0.5;
+        const cyN = p.cropCy ?? 0.5;
+        let srcX = cxN * nw - cropW / 2;
+        let srcY = cyN * nh - cropH / 2;
+        srcX = Math.max(0, Math.min(nw - cropW, srcX));
+        srcY = Math.max(0, Math.min(nh - cropH, srcY));
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.rotate(((p.rotation || 0) * Math.PI) / 180);
+        ctx.drawImage(img, srcX, srcY, cropW, cropH, -w / 2, -h / 2, w, h);
+        ctx.restore();
+        onProgress((i + 1) / placed.length);
+        // Yield damit der Progressbalken neu zeichnen kann.
+        await new Promise((r) => setTimeout(r, 0));
+      }
+      return await new Promise((resolve) => canvas.toBlob(resolve, mime, quality));
+    }
+
+    function downloadBlob(blob, filename) {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    // ---------------------------------------------------------------------------
+    //  hooks/useCollageStore.js
+    //  Mini-Store: ein Hook mit allem State + memoisierten Aktionen.
+    // ---------------------------------------------------------------------------
+    function useCollageStore() {
+      const [items, setItems] = useState([]);
+      const [placed, setPlaced] = useState([]);
+      const [background, setBackground] = useState(DEFAULT_BG);
+      const [spacing, setSpacing] = useState(DEFAULT_SPACING);
+      const [snap, setSnap] = useState(true);
+      const [selectedId, setSelectedId] = useState(null);
+      const [swapMode, setSwapMode] = useState(false);
+      const [swapFirstId, setSwapFirstId] = useState(null);
+      const [panMode, setPanMode] = useState(false);
+
+      const itemsById = useMemo(() => new Map(items.map((i) => [i.id, i])), [items]);
+
+      const addItems = useCallback((ones) => setItems((prev) => [...prev, ...ones]), []);
+      const removeItem = useCallback((id) => {
+        setItems((prev) => prev.filter((i) => i.id !== id));
+        setPlaced((prev) => prev.filter((p) => p.id !== id));
+        setSelectedId((s) => (s === id ? null : s));
+      }, []);
+      const clearAll = useCallback(() => {
+        setItems([]); setPlaced([]); setSelectedId(null);
+      }, []);
+      const applyLayout = useCallback((name, sw, sh) => {
+        const fn = LAYOUTS[name]?.fn;
+        if (!fn) return;
+        setPlaced(fn(items, sw, sh, spacing));
+      }, [items, spacing]);
+      const updatePlaced = useCallback((id, patch) => {
+        setPlaced((prev) => prev.map((p) => (p.id === id ? { ...p, ...patch } : p)));
+      }, []);
+      const bringToFront = useCallback((id) => {
+        setPlaced((prev) => {
+          const idx = prev.findIndex((p) => p.id === id);
+          if (idx < 0 || idx === prev.length - 1) return prev;
+          const copy = prev.slice();
+          const [it] = copy.splice(idx, 1);
+          copy.push(it);
+          return copy;
+        });
+      }, []);
+      // Tausch zweier Slots — Geometrie bleibt, nur die Bild-IDs werden vertauscht.
+      const swapPlaced = useCallback((idA, idB) => {
+        if (idA === idB) return;
+        setPlaced((prev) => {
+          const ia = prev.findIndex((p) => p.id === idA);
+          const ib = prev.findIndex((p) => p.id === idB);
+          if (ia < 0 || ib < 0) return prev;
+          const copy = prev.slice();
+          copy[ia] = { ...copy[ia], id: idB };
+          copy[ib] = { ...copy[ib], id: idA };
+          return copy;
+        });
+      }, []);
+      const toggleSwapMode = useCallback(() => {
+        setSwapMode((m) => {
+          if (m) setSwapFirstId(null);
+          return !m;
+        });
+        setPanMode(false);
+        setSelectedId(null);
+      }, []);
+      const togglePanMode = useCallback(() => {
+        setPanMode((p) => !p);
+        setSwapMode(false);
+        setSwapFirstId(null);
+        setSelectedId(null);
+      }, []);
+
+      return {
+        items, placed, background, spacing, snap, selectedId, itemsById,
+        swapMode, swapFirstId, panMode,
+        setBackground, setSpacing, setSnap, setSelectedId, setSwapFirstId,
+        addItems, removeItem, clearAll, applyLayout, updatePlaced, bringToFront,
+        swapPlaced, toggleSwapMode, togglePanMode,
+      };
+    }
+
+    // ---------------------------------------------------------------------------
+    //  KonvaStage — imperativer Wrapper um Konva (statt react-konva).
+    //  In der Bundle-Version wird react-konva verwendet; im Single-File spart der
+    //  imperative Wrapper sich die UMD-Frage.
+    // ---------------------------------------------------------------------------
+    function KonvaStage({
+      width, height, background, placed, itemsById,
+      selectedId, onSelect, onUpdate, onBringToFront,
+      snap, showGrid,
+      swapMode, swapFirstId, onTileClick, panMode,
+    }) {
+      const containerRef = useRef(null);
+      const stageRef = useRef(null);
+      const bgRectRef = useRef(null);
+      const gridLayerRef = useRef(null);
+      const layerRef = useRef(null);
+      const trRef = useRef(null);
+      const nodesRef = useRef(new Map()); // id -> Konva.Image
+
+      // Refs damit Event-Handler immer die aktuellen Callback-Werte sehen, ohne
+      // dass wir die Konva-Knoten neu binden müssen.
+      const onSelectRef = useRef(onSelect);
+      const onUpdateRef = useRef(onUpdate);
+      const onBringRef = useRef(onBringToFront);
+      const onTileClickRef = useRef(onTileClick);
+      const snapRef = useRef(snap);
+      const panModeRef = useRef(panMode);
+      useEffect(() => { onSelectRef.current = onSelect; }, [onSelect]);
+      useEffect(() => { onUpdateRef.current = onUpdate; }, [onUpdate]);
+      useEffect(() => { onBringRef.current = onBringToFront; }, [onBringToFront]);
+      useEffect(() => { onTileClickRef.current = onTileClick; }, [onTileClick]);
+      useEffect(() => { snapRef.current = snap; }, [snap]);
+      useEffect(() => { panModeRef.current = panMode; }, [panMode]);
+
+      // Stage einmalig erzeugen.
+      useEffect(() => {
+        const stage = new Konva.Stage({ container: containerRef.current, width, height });
+        const bgLayer = new Konva.Layer({ listening: true });
+        const bgRect = new Konva.Rect({ x: 0, y: 0, width, height, fill: background });
+        bgLayer.add(bgRect);
+        stage.add(bgLayer);
+
+        const gridLayer = new Konva.Layer({ listening: false });
+        stage.add(gridLayer);
+
+        const layer = new Konva.Layer();
+        stage.add(layer);
+
+        const tr = new Konva.Transformer({
+          keepRatio: true, rotateEnabled: true,
+          enabledAnchors: ['top-left', 'top-right', 'bottom-left', 'bottom-right'],
+          anchorStroke: '#5eead4', anchorFill: '#0b0d10', borderStroke: '#5eead4',
+          boundBoxFunc: (oldBox, newBox) =>
+            (newBox.width < 30 || newBox.height < 30) ? oldBox : newBox,
+        });
+        layer.add(tr);
+
+        // Klick auf leere Stage / Hintergrund => Auswahl aufheben.
+        const onStageDown = (e) => {
+          if (e.target === stage || e.target === bgRect) onSelectRef.current(null);
+        };
+        stage.on('mousedown touchstart', onStageDown);
+
+        stageRef.current = stage;
+        bgRectRef.current = bgRect;
+        gridLayerRef.current = gridLayer;
+        layerRef.current = layer;
+        trRef.current = tr;
+
+        return () => stage.destroy();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, []);
+
+      // Größe / Hintergrund nachziehen.
+      useEffect(() => {
+        const stage = stageRef.current; if (!stage) return;
+        stage.size({ width, height });
+        bgRectRef.current.size({ width, height });
+        bgRectRef.current.fill(background);
+        stage.batchDraw();
+      }, [width, height, background]);
+
+      // Grid neu zeichnen.
+      useEffect(() => {
+        const gl = gridLayerRef.current; if (!gl) return;
+        gl.destroyChildren();
+        if (showGrid) {
+          for (let x = SNAP_GRID; x < width; x += SNAP_GRID) {
+            gl.add(new Konva.Line({ points: [x, 0, x, height], stroke: '#ffffff', opacity: 0.05 }));
+          }
+          for (let y = SNAP_GRID; y < height; y += SNAP_GRID) {
+            gl.add(new Konva.Line({ points: [0, y, width, y], stroke: '#ffffff', opacity: 0.05 }));
+          }
+        }
+        gl.batchDraw();
+      }, [showGrid, width, height]);
+
+      // Cover-Fit-Crop mit Zoom. cropZoom ≥ 1 verkleinert die sichtbare
+      // Quellfläche (Reinzoomen). cropCx/cropCy ∈ [0,1] zentriert den Crop.
+      const MIN_ZOOM = 1, MAX_ZOOM = 10;
+      const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+      const computeCrop = (imageEl, p) => {
+        if (!imageEl || !imageEl.naturalWidth) return null;
+        const nw = imageEl.naturalWidth, nh = imageEl.naturalHeight;
+        const arImg = nw / nh, arTile = p.width / p.height;
+        let cropW0, cropH0;
+        if (arImg > arTile) { cropH0 = nh; cropW0 = cropH0 * arTile; }
+        else                { cropW0 = nw; cropH0 = cropW0 / arTile; }
+        const z = clamp(p.cropZoom ?? 1, MIN_ZOOM, MAX_ZOOM);
+        const cropW = cropW0 / z, cropH = cropH0 / z;
+        const cx = p.cropCx ?? 0.5, cy = p.cropCy ?? 0.5;
+        let x = cx * nw - cropW / 2;
+        let y = cy * nh - cropH / 2;
+        x = Math.max(0, Math.min(nw - cropW, x));
+        y = Math.max(0, Math.min(nh - cropH, y));
+        return { x, y, width: cropW, height: cropH, nw, nh, cropW0, cropH0 };
+      };
+      // Neue Crop-Position berechnet so dass (fx,fy) ∈ [0,1] (Punkt in der Kachel)
+      // weiterhin auf demselben Quellpixel landet — "Zoom zum Cursor".
+      const zoomToFocus = (oldCrop, newZoom, fx, fy) => {
+        const z = clamp(newZoom, MIN_ZOOM, MAX_ZOOM);
+        const cropW = oldCrop.cropW0 / z;
+        const cropH = oldCrop.cropH0 / z;
+        const srcX = oldCrop.x + fx * oldCrop.width;
+        const srcY = oldCrop.y + fy * oldCrop.height;
+        let cropX = srcX - fx * cropW;
+        let cropY = srcY - fy * cropH;
+        cropX = Math.max(0, Math.min(oldCrop.nw - cropW, cropX));
+        cropY = Math.max(0, Math.min(oldCrop.nh - cropH, cropY));
+        return {
+          cropZoom: z,
+          cropCx: (cropX + cropW / 2) / oldCrop.nw,
+          cropCy: (cropY + cropH / 2) / oldCrop.nh,
+          live: { x: cropX, y: cropY, width: cropW, height: cropH },
+        };
+      };
+      const tileFraction = (node, pt) => {
+        const tr = node.getAbsoluteTransform().copy().invert();
+        const lp = tr.point(pt);
+        return { fx: lp.x / node.width(), fy: lp.y / node.height() };
+      };
+
+      // Bild-Knoten synchronisieren.
+      useEffect(() => {
+        const layer = layerRef.current; if (!layer) return;
+        const nodes = nodesRef.current;
+        const placedIds = new Set(placed.map((p) => p.id));
+
+        // Entfernte Knoten weg.
+        nodes.forEach((node, id) => {
+          if (!placedIds.has(id)) { node.destroy(); nodes.delete(id); }
+        });
+
+        // Hinzufügen / aktualisieren.
+        placed.forEach((p, i) => {
+          const item = itemsById.get(p.id);
+          if (!item) return;
+          let node = nodes.get(p.id);
+          if (!node) {
+            node = new Konva.Image({ image: item.preview, draggable: true });
+
+            node.on('mousedown touchstart', () => {
+              onTileClickRef.current(node._tileId);
+            });
+
+            // Mausrad / Trackpad-Pinch: Zoom zum Cursor (nur im Pan-Modus).
+            node.on('wheel', (e) => {
+              if (!panModeRef.current) return;
+              e.evt.preventDefault();
+              const stage = node.getStage();
+              const ptr = stage?.getPointerPosition();
+              const tileNow = node._tile;
+              const itemNow = node._item;
+              if (!ptr || !tileNow || !itemNow) return;
+              const c = computeCrop(itemNow.preview, tileNow);
+              if (!c) return;
+              const { fx, fy } = tileFraction(node, ptr);
+              if (fx < 0 || fx > 1 || fy < 0 || fy > 1) return;
+              const oldZoom = clamp(tileNow.cropZoom ?? 1, MIN_ZOOM, MAX_ZOOM);
+              const factor = Math.exp(-e.evt.deltaY * 0.002);
+              const newZoom = clamp(oldZoom * factor, MIN_ZOOM, MAX_ZOOM);
+              if (Math.abs(newZoom - oldZoom) < 1e-4) return;
+              const r = zoomToFocus(c, newZoom, fx, fy);
+              onUpdateRef.current(node._tileId, {
+                cropZoom: r.cropZoom, cropCx: r.cropCx, cropCy: r.cropCy,
+              });
+            });
+
+            // Pinch (2 Finger) auf iPad/Touch.
+            node.on('touchstart', (e) => {
+              if (!panModeRef.current) return;
+              const tt = e.evt.touches;
+              if (!tt || tt.length < 2) return;
+              e.evt.preventDefault();
+              const stage = node.getStage();
+              const tileNow = node._tile;
+              const itemNow = node._item;
+              if (!stage || !tileNow || !itemNow) return;
+              try { node.stopDrag(); } catch (_) {}
+              node._panState = null;
+              const c = computeCrop(itemNow.preview, tileNow);
+              if (!c) return;
+              const r = stage.container().getBoundingClientRect();
+              const t0 = { x: tt[0].clientX - r.left, y: tt[0].clientY - r.top };
+              const t1 = { x: tt[1].clientX - r.left, y: tt[1].clientY - r.top };
+              const dist = Math.hypot(t1.x - t0.x, t1.y - t0.y);
+              const mid = { x: (t0.x + t1.x) / 2, y: (t0.y + t1.y) / 2 };
+              const { fx, fy } = tileFraction(node, mid);
+              node._pinch = {
+                startDist: dist || 1,
+                startZoom: clamp(tileNow.cropZoom ?? 1, MIN_ZOOM, MAX_ZOOM),
+                fx, fy, baseCrop: c, last: null,
+              };
+            });
+            node.on('touchmove', (e) => {
+              const ps = node._pinch;
+              if (!ps) return;
+              const tt = e.evt.touches;
+              if (!tt || tt.length < 2) return;
+              e.evt.preventDefault();
+              const stage = node.getStage();
+              if (!stage) return;
+              const r = stage.container().getBoundingClientRect();
+              const t0 = { x: tt[0].clientX - r.left, y: tt[0].clientY - r.top };
+              const t1 = { x: tt[1].clientX - r.left, y: tt[1].clientY - r.top };
+              const dist = Math.hypot(t1.x - t0.x, t1.y - t0.y);
+              const newZoom = clamp(ps.startZoom * (dist / ps.startDist), MIN_ZOOM, MAX_ZOOM);
+              const out = zoomToFocus(ps.baseCrop, newZoom, ps.fx, ps.fy);
+              ps.last = out;
+              node.crop(out.live);
+              node.getLayer()?.batchDraw();
+            });
+            node.on('touchend', (e) => {
+              const ps = node._pinch;
+              if (!ps) return;
+              if (e.evt.touches && e.evt.touches.length >= 2) return;
+              node._pinch = null;
+              if (ps.last) {
+                onUpdateRef.current(node._tileId, {
+                  cropZoom: ps.last.cropZoom,
+                  cropCx: ps.last.cropCx,
+                  cropCy: ps.last.cropCy,
+                });
+              }
+            });
+
+            // Pan-Modus: Position sperren und Crop-Offset stattdessen anpassen.
+            node.dragBoundFunc((pos) => {
+              if (!panModeRef.current) return pos;
+              const st = node._panState;
+              if (!st) return pos;
+              const stage = node.getStage();
+              const ptr = stage?.getPointerPosition();
+              if (!ptr) return { x: st.origX, y: st.origY };
+              const dx = ptr.x - st.startPtrX;
+              const dy = ptr.y - st.startPtrY;
+              const dCropX = -dx * (st.cropW / st.tileW);
+              const dCropY = -dy * (st.cropH / st.tileH);
+              let cx = st.initialCropX + dCropX;
+              let cy = st.initialCropY + dCropY;
+              cx = Math.max(0, Math.min(st.nw - st.cropW, cx));
+              cy = Math.max(0, Math.min(st.nh - st.cropH, cy));
+              node.crop({ x: cx, y: cy, width: st.cropW, height: st.cropH });
+              node.getLayer()?.batchDraw();
+              st.lastCx = (cx + st.cropW / 2) / st.nw;
+              st.lastCy = (cy + st.cropH / 2) / st.nh;
+              return { x: st.origX, y: st.origY };
+            });
+
+            node.on('dragstart', () => {
+              if (node._pinch) return;
+              if (!panModeRef.current) return;
+              const stage = node.getStage();
+              const ptr = stage?.getPointerPosition();
+              const tileNow = node._tile;
+              const itemNow = node._item;
+              if (!ptr || !tileNow || !itemNow) return;
+              const c = computeCrop(itemNow.preview, tileNow);
+              if (!c) return;
+              node._panState = {
+                startPtrX: ptr.x, startPtrY: ptr.y,
+                origX: tileNow.x, origY: tileNow.y,
+                nw: c.nw, nh: c.nh,
+                cropW: c.width, cropH: c.height,
+                tileW: tileNow.width, tileH: tileNow.height,
+                initialCropX: c.x, initialCropY: c.y,
+                lastCx: tileNow.cropCx ?? 0.5,
+                lastCy: tileNow.cropCy ?? 0.5,
+              };
+            });
+
+            node.on('dragend', () => {
+              if (panModeRef.current) {
+                const st = node._panState;
+                node._panState = null;
+                if (st) onUpdateRef.current(node._tileId, { cropCx: st.lastCx, cropCy: st.lastCy });
+                return;
+              }
+              let x = node.x(), y = node.y();
+              if (snapRef.current) {
+                const sv = (v) => {
+                  const nearest = Math.round(v / SNAP_GRID) * SNAP_GRID;
+                  return Math.abs(v - nearest) < SNAP_THRESHOLD ? nearest : v;
+                };
+                x = sv(x); y = sv(y);
+                node.position({ x, y });
+              }
+              onUpdateRef.current(node._tileId, { x, y });
+            });
+
+            node.on('transformend', () => {
+              const sx = node.scaleX(), sy = node.scaleY();
+              const w = Math.max(20, node.width() * sx);
+              const h = Math.max(20, node.height() * sy);
+              node.scaleX(1); node.scaleY(1);
+              node.size({ width: w, height: h });
+              node.offset({ x: w / 2, y: h / 2 });
+              onUpdateRef.current(node._tileId, {
+                x: node.x(), y: node.y(),
+                width: w, height: h, rotation: node.rotation(),
+              });
+            });
+
+            layer.add(node);
+            nodes.set(p.id, node);
+          }
+          node._tileId = p.id;
+          node._tile = p;
+          node._item = item;
+          node.image(item.preview);
+          node.position({ x: p.x, y: p.y });
+          node.size({ width: p.width, height: p.height });
+          node.offset({ x: p.width / 2, y: p.height / 2 });
+          node.rotation(p.rotation || 0);
+          // Cover-Fit-Crop deklarativ setzen (überschreibt Live-Pan nach dragend).
+          const c = computeCrop(item.preview, p);
+          if (c) node.crop({ x: c.x, y: c.y, width: c.width, height: c.height });
+          else node.crop(null);
+          node.zIndex(i);
+          // Swap-Modus: ziehen aus; Pan-Modus: ziehen an, aber Position gesperrt.
+          node.draggable(!swapMode);
+          const isPick = swapMode && swapFirstId === p.id;
+          node.stroke(isPick ? '#fbbf24' : null);
+          node.strokeWidth(isPick ? 4 : 0);
+          node.opacity(swapMode && !isPick ? 0.85 : 1);
+        });
+
+        // Transformer immer ganz oben + an Auswahl heften (im Swap-/Pan-Modus aus).
+        const tr = trRef.current;
+        if (!swapMode && !panMode && selectedId && nodes.has(selectedId)) {
+          tr.nodes([nodes.get(selectedId)]);
+        } else {
+          tr.nodes([]);
+        }
+        tr.moveToTop();
+
+        layer.batchDraw();
+      }, [placed, itemsById, selectedId, swapMode, swapFirstId, panMode]);
+
+      return <div ref={containerRef} />;
+    }
+
+    // ---------------------------------------------------------------------------
+    //  CollageEditor — sizing + KonvaStage + leere-Bühne-Hint
+    // ---------------------------------------------------------------------------
+    function CollageEditor(props) {
+      const wrapRef = useRef(null);
+      const [size, setSize] = useState({ w: 800, h: 450 });
+
+      useLayoutEffect(() => {
+        if (!wrapRef.current) return;
+        const ro = new ResizeObserver(([entry]) => {
+          const cw = entry.contentRect.width - 24;
+          const ch = entry.contentRect.height - 24;
+          if (cw <= 0 || ch <= 0) return;
+          let w = cw, h = w / EXPORT_ASPECT;
+          if (h > ch) { h = ch; w = h * EXPORT_ASPECT; }
+          setSize({ w: Math.floor(w), h: Math.floor(h) });
+        });
+        ro.observe(wrapRef.current);
+        return () => ro.disconnect();
+      }, []);
+
+      useEffect(() => { props.onStageSize?.(size.w, size.h); }, [size.w, size.h]);
+
+      return (
+        <div ref={wrapRef} className="flex h-full w-full items-center justify-center p-3">
+          <div
+            className="overflow-hidden rounded-lg shadow-soft"
+            style={{ width: size.w, height: size.h, background: props.background }}
+          >
+            <KonvaStage
+              width={size.w}
+              height={size.h}
+              background={props.background}
+              placed={props.placed}
+              itemsById={props.itemsById}
+              selectedId={props.selectedId}
+              onSelect={props.onSelect}
+              onUpdate={props.onUpdate}
+              onBringToFront={props.onBringToFront}
+              snap={props.snap}
+              showGrid={props.showGrid}
+              swapMode={props.swapMode}
+              swapFirstId={props.swapFirstId}
+              onTileClick={props.onTileClick}
+              panMode={props.panMode}
+            />
+          </div>
+        </div>
+      );
+    }
+
+    // ---------------------------------------------------------------------------
+    //  ImageUploader — verstecktes input + Drop-Zone-Wrapper.
+    // ---------------------------------------------------------------------------
+    const ImageUploader = forwardRef(function ImageUploader(
+      { onAdd, currentCount, children }, ref
+    ) {
+      const inputRef = useRef(null);
+      const [busy, setBusy] = useState(false);
+      const [dragOver, setDragOver] = useState(false);
+
+      useImperativeHandle(ref, () => ({ open: () => inputRef.current?.click() }));
+
+      const ingest = useCallback(async (fileList) => {
+        const files = Array.from(fileList).filter((f) => f.type.startsWith('image/'));
+        if (!files.length) return;
+        const room = Math.max(0, MAX_IMAGES - currentCount);
+        const slice = files.slice(0, room);
+        if (!slice.length) return;
+        setBusy(true);
+        try {
+          const records = await Promise.all(slice.map((f) => processFile(f)));
+          onAdd(records);
+        } finally {
+          setBusy(false);
+        }
+      }, [currentCount, onAdd]);
+
+      return (
+        <div
+          onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={(e) => { e.preventDefault(); setDragOver(false); ingest(e.dataTransfer.files); }}
+          className={'relative flex-1 ' + (dragOver ? 'drop-active' : '')}
+        >
+          <input
+            ref={inputRef} type="file" accept="image/*" multiple className="hidden"
+            onChange={(e) => { ingest(e.target.files); e.target.value = ''; }}
+          />
+          {children}
+          {busy && (
+            <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-ink-900/60">
+              <div className="rounded-md bg-ink-700 px-4 py-2 text-sm">Bilder werden verarbeitet…</div>
+            </div>
+          )}
+        </div>
+      );
+    });
+
+    // ---------------------------------------------------------------------------
+    //  ThumbnailPanel
+    // ---------------------------------------------------------------------------
+    function ThumbnailPanel({ items, selectedId, onSelect, onRemove }) {
+      if (!items.length) {
+        return (
+          <aside className="hidden w-64 shrink-0 border-r border-ink-700 bg-ink-800 p-4 text-sm text-slate-400 lg:block">
+            <p className="mb-2 font-medium text-slate-200">Noch keine Bilder</p>
+            <p>Fotos auf die Bühne ziehen oder oben auf <span className="text-accent">Bilder hochladen</span> klicken.</p>
+          </aside>
+        );
+      }
+      return (
+        <aside className="scroll-thin hidden w-64 shrink-0 overflow-y-auto border-r border-ink-700 bg-ink-800 p-3 lg:block">
+          <p className="mb-3 text-xs uppercase tracking-wide text-slate-400">Fotos · {items.length}</p>
+          <ul className="grid grid-cols-2 gap-2">
+            {items.map((it) => {
+              const active = selectedId === it.id;
+              return (
+                <li key={it.id} className="group relative">
+                  <button
+                    type="button"
+                    onClick={() => onSelect(it.id)}
+                    className={'block w-full overflow-hidden rounded-md border ' +
+                      (active ? 'border-accent ring-2 ring-accent/40'
+                              : 'border-ink-600 hover:border-slate-400')}
+                    title={it.name}
+                  >
+                    <img src={it.thumb.src} alt={it.name}
+                         className="aspect-square h-auto w-full object-cover" loading="lazy" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onRemove(it.id)}
+                    className="absolute right-1 top-1 hidden h-6 w-6 items-center justify-center rounded-full bg-ink-900/80 text-slate-200 hover:bg-rose-500 hover:text-white group-hover:flex"
+                    title="Entfernen"
+                  >×</button>
+                </li>
+              );
+            })}
+          </ul>
+        </aside>
+      );
+    }
+
+    // ---------------------------------------------------------------------------
+    //  Toolbar
+    // ---------------------------------------------------------------------------
+    function Toolbar({ count, onUploadClick, onApplyLayout, onReset, onExportJpeg, onExportPng, exporting, swapMode, onToggleSwap, panMode, onTogglePan }) {
+      const canExport = count >= 1 && !exporting;
+      return (
+        <header className="flex flex-wrap items-center gap-2 border-b border-ink-700 bg-ink-800 px-4 py-3 shadow-soft">
+          <div className="flex items-center gap-2">
+            <span className="text-accent text-lg font-semibold tracking-tight">Collage Studio</span>
+            <span className="hidden text-xs text-slate-400 sm:inline">4K Export</span>
+          </div>
+          <div className="ml-auto flex flex-wrap items-center gap-2">
+            <button onClick={onUploadClick}
+              className="rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-ink-900 hover:bg-accent-soft">
+              Bilder hochladen
+            </button>
+            <div className="flex items-center gap-1 rounded-md bg-ink-700 p-1">
+              {Object.entries(LAYOUTS).map(([key, { label }]) => (
+                <button key={key} onClick={() => onApplyLayout(key)} disabled={count === 0}
+                  className="rounded px-2 py-1 text-xs text-slate-200 hover:bg-ink-600 disabled:opacity-40"
+                  title={`Layout ${label}`}>{label}</button>
+              ))}
+            </div>
+            <button onClick={onToggleSwap} disabled={count < 2}
+              className={'rounded-md px-3 py-1.5 text-sm disabled:opacity-40 ' +
+                (swapMode
+                  ? 'bg-amber-400 text-ink-900 hover:bg-amber-300'
+                  : 'border border-ink-600 hover:bg-ink-700')}
+              title="Tauschen: zwei Kacheln anklicken, um die Bilder zu vertauschen">
+              {swapMode ? 'Tauschen: zwei wählen…' : 'Tauschen'}
+            </button>
+            <button onClick={onTogglePan} disabled={count === 0}
+              className={'rounded-md px-3 py-1.5 text-sm disabled:opacity-40 ' +
+                (panMode
+                  ? 'bg-sky-400 text-ink-900 hover:bg-sky-300'
+                  : 'border border-ink-600 hover:bg-ink-700')}
+              title="Pan-Modus: in Kachel ziehen verschiebt; Mausrad oder Pinch zoomt">
+              {panMode ? 'Pan: ziehen · scroll/pinch zoomt' : 'Pan / Zoom'}
+            </button>
+            <button onClick={onReset} disabled={count === 0}
+              className="rounded-md border border-ink-600 px-3 py-1.5 text-sm hover:bg-ink-700 disabled:opacity-40">
+              Reset
+            </button>
+            <div className="flex overflow-hidden rounded-md">
+              <button onClick={onExportJpeg} disabled={!canExport}
+                className="bg-emerald-500 px-3 py-1.5 text-sm font-medium text-ink-900 hover:bg-emerald-400 disabled:opacity-40">
+                JPEG (4K)
+              </button>
+              <button onClick={onExportPng} disabled={!canExport}
+                className="border-l border-emerald-700 bg-emerald-500 px-3 py-1.5 text-sm font-medium text-ink-900 hover:bg-emerald-400 disabled:opacity-40">
+                PNG
+              </button>
+            </div>
+            <span className={'ml-2 text-xs ' +
+              (count < MIN_IMAGES || count > MAX_IMAGES ? 'text-amber-400' : 'text-slate-400')}
+              title={`Empfohlen: ${MIN_IMAGES}–${MAX_IMAGES} Bilder`}>
+              {count} / {MIN_IMAGES}–{MAX_IMAGES}
+            </span>
+          </div>
+        </header>
+      );
+    }
+
+    // ---------------------------------------------------------------------------
+    //  SettingsPanel
+    // ---------------------------------------------------------------------------
+    function SettingsPanel({ background, onBackground, spacing, onSpacing, snap, onSnap, showGrid, onShowGrid }) {
+      return (
+        <div className="pointer-events-auto absolute bottom-3 left-3 flex flex-wrap items-center gap-3 rounded-md border border-ink-700 bg-ink-800/90 px-3 py-2 text-xs shadow-soft backdrop-blur">
+          <label className="flex items-center gap-2">
+            <span className="text-slate-300">Hintergrund</span>
+            <input type="color" value={background} onChange={(e) => onBackground(e.target.value)}
+              className="h-6 w-8 cursor-pointer rounded border border-ink-600 bg-transparent" />
+          </label>
+          <label className="flex items-center gap-2">
+            <span className="text-slate-300">Abstand</span>
+            <input type="range" min={0} max={40} value={spacing}
+              onChange={(e) => onSpacing(Number(e.target.value))}
+              className="w-28 accent-accent" />
+            <span className="w-6 text-right tabular-nums text-slate-400">{spacing}</span>
+          </label>
+          <label className="flex items-center gap-2">
+            <input type="checkbox" checked={snap} onChange={(e) => onSnap(e.target.checked)} className="accent-accent" />
+            <span className="text-slate-300">Raster-Snap</span>
+          </label>
+          <label className="flex items-center gap-2">
+            <input type="checkbox" checked={showGrid} onChange={(e) => onShowGrid(e.target.checked)} className="accent-accent" />
+            <span className="text-slate-300">Raster anzeigen</span>
+          </label>
+        </div>
+      );
+    }
+
+    // ---------------------------------------------------------------------------
+    //  ExportProgress
+    // ---------------------------------------------------------------------------
+    function ExportProgress({ active, progress, label }) {
+      if (!active) return null;
+      const pct = Math.round((progress || 0) * 100);
+      return (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-ink-900/70 backdrop-blur-sm">
+          <div className="w-72 rounded-lg border border-ink-700 bg-ink-800 p-5 shadow-soft">
+            <div className="mb-2 text-sm text-slate-200">{label || 'Exportiere…'}</div>
+            <div className="h-2 w-full overflow-hidden rounded bg-ink-700">
+              <div className="h-full bg-accent transition-[width] duration-150" style={{ width: pct + '%' }} />
+            </div>
+            <div className="mt-2 text-right text-xs text-slate-400 tabular-nums">{pct}%</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ---------------------------------------------------------------------------
+    //  App — Wurzelkomponente
+    // ---------------------------------------------------------------------------
+    function App() {
+      const store = useCollageStore();
+      const uploaderRef = useRef(null);
+      const [stageSize, setStageSize] = useState({ w: 1280, h: 720 });
+      const onStageSize = useCallback((w, h) => setStageSize({ w, h }), []);
+      const [showGrid, setShowGrid] = useState(false);
+
+      const [exporting, setExporting] = useState(false);
+      const [exportProgress, setExportProgress] = useState(0);
+      const [exportLabel, setExportLabel] = useState('');
+
+      // Auto-Grid bei Bildänderungen.
+      const itemCount = store.items.length;
+      useEffect(() => {
+        if (itemCount === 0) return;
+        store.applyLayout('grid', stageSize.w, stageSize.h);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [itemCount]);
+
+      // Spacing-Änderung => Grid neu rechnen.
+      useEffect(() => {
+        if (!store.items.length) return;
+        store.applyLayout('grid', stageSize.w, stageSize.h);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [store.spacing]);
+
+      const handleAdd = useCallback((records) => store.addItems(records), [store]);
+      const onApplyLayout = (name) => store.applyLayout(name, stageSize.w, stageSize.h);
+      const onReset = () => store.applyLayout('grid', stageSize.w, stageSize.h);
+
+      // Im Swap-Modus picken Klicks Kacheln; im Pan-Modus selektieren wir nicht
+      // (sonst würde der Transformer aufpoppen, obwohl gepannt wird).
+      const onTileClick = useCallback((id) => {
+        if (store.panMode) return;
+        if (!store.swapMode) {
+          store.setSelectedId(id);
+          if (id != null) store.bringToFront(id);
+          return;
+        }
+        if (id == null) { store.setSwapFirstId(null); return; }
+        if (store.swapFirstId == null) {
+          store.setSwapFirstId(id);
+        } else if (store.swapFirstId !== id) {
+          store.swapPlaced(store.swapFirstId, id);
+          store.setSwapFirstId(null);
+        } else {
+          store.setSwapFirstId(null);
+        }
+      }, [store]);
+
+      const doExport = async (mime, ext, quality) => {
+        if (!store.placed.length) return;
+        setExporting(true);
+        setExportProgress(0);
+        setExportLabel(`4K-${ext.toUpperCase()} wird gerendert…`);
+        try {
+          const blob = await renderCollageBlob({
+            placed: store.placed, itemsById: store.itemsById,
+            stageW: stageSize.w, stageH: stageSize.h,
+            background: store.background,
+            mime, quality,
+            onProgress: setExportProgress,
+          });
+          if (blob) downloadBlob(blob, `collage-4k-${Date.now()}.${ext}`);
+        } finally {
+          setExporting(false);
+        }
+      };
+
+      return (
+        <div className="flex h-screen flex-col">
+          <Toolbar
+            count={store.items.length}
+            onUploadClick={() => uploaderRef.current?.open()}
+            onApplyLayout={onApplyLayout}
+            onReset={onReset}
+            onExportJpeg={() => doExport('image/jpeg', 'jpg', 0.92)}
+            onExportPng={() => doExport('image/png', 'png')}
+            exporting={exporting}
+            swapMode={store.swapMode}
+            onToggleSwap={store.toggleSwapMode}
+            panMode={store.panMode}
+            onTogglePan={store.togglePanMode}
+          />
+          <div className="relative flex flex-1 overflow-hidden">
+            <ThumbnailPanel
+              items={store.items}
+              selectedId={store.selectedId}
+              onSelect={store.setSelectedId}
+              onRemove={store.removeItem}
+            />
+            <ImageUploader ref={uploaderRef} onAdd={handleAdd} currentCount={store.items.length}>
+              <CollageEditor
+                items={store.items}
+                itemsById={store.itemsById}
+                placed={store.placed}
+                selectedId={store.selectedId}
+                onSelect={store.setSelectedId}
+                onTileClick={onTileClick}
+                onUpdate={store.updatePlaced}
+                onBringToFront={store.bringToFront}
+                background={store.background}
+                snap={store.snap}
+                showGrid={showGrid}
+                swapMode={store.swapMode}
+                swapFirstId={store.swapFirstId}
+                panMode={store.panMode}
+                onStageSize={onStageSize}
+              />
+              <SettingsPanel
+                background={store.background}
+                onBackground={store.setBackground}
+                spacing={store.spacing}
+                onSpacing={store.setSpacing}
+                snap={store.snap}
+                onSnap={store.setSnap}
+                showGrid={showGrid}
+                onShowGrid={setShowGrid}
+              />
+              {store.items.length === 0 && (
+                <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+                  <div className="rounded-lg border border-dashed border-ink-600 bg-ink-800/60 px-6 py-5 text-center text-slate-300">
+                    <p className="text-base font-medium">15–25 Fotos hier ablegen</p>
+                    <p className="mt-1 text-sm text-slate-400">oder oben auf „Bilder hochladen"</p>
+                  </div>
+                </div>
+              )}
+              <ExportProgress active={exporting} progress={exportProgress} label={exportLabel} />
+            </ImageUploader>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    </script>
   </body>
 </html>
