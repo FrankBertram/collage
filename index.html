@@ -186,73 +186,88 @@
       });
     }
 
+    // JUSTIFIED (Basis für Rows und Cols) — Bilder werden in Linien (Zeilen bzw.
+    // Spalten) gruppiert; jede Linie füllt die Hauptachse exakt.
+    //  1. Optimale Partition per DP: Linien mit möglichst gleicher Aspect-Summe,
+    //     damit keine "Restlinie" mit wenigen, riesigen Bildern übrig bleibt.
+    //  2. Mehrere Mischungen × alle Linienanzahlen probieren; aus den besten
+    //     Kandidaten zufällig wählen → jeder Klick ergibt ein neues Bild.
+    //  3. Reihenfolge der Linien zufällig → größere Linien landen überall.
+    function balancedPartition(vals, k) {
+      const n = vals.length;
+      const P = [0];
+      for (let i = 0; i < n; i++) P.push(P[i] + vals[i]);
+      const target = P[n] / k;
+      const cost = (a, b) => (P[b] - P[a] - target) ** 2;
+      // dp[j][i]: minimale Kosten, die ersten i Werte in j Linien zu teilen.
+      const dp = Array.from({ length: k + 1 }, () => new Array(n + 1).fill(Infinity));
+      const cut = Array.from({ length: k + 1 }, () => new Array(n + 1).fill(0));
+      dp[0][0] = 0;
+      for (let j = 1; j <= k; j++) {
+        for (let i = j; i <= n - (k - j); i++) {
+          for (let m = j - 1; m < i; m++) {
+            const c = dp[j - 1][m] + cost(m, i);
+            if (c < dp[j][i]) { dp[j][i] = c; cut[j][i] = m; }
+          }
+        }
+      }
+      const groups = [];
+      let i = n;
+      for (let j = k; j >= 1; j--) {
+        const m = cut[j][i];
+        groups.unshift([m, i]);
+        i = m;
+      }
+      return groups;
+    }
+
+    // vals[i]: Ausdehnung von Bild i entlang der Hauptachse pro Einheit Dicke.
+    // Liefert Linien als { idx: [...], thick, crossScale } in Bühnenkoordinaten.
+    function justifiedLines(vals, mainLen, crossLen, spacing) {
+      const n = vals.length;
+      const ATTEMPTS = 12;
+      const candidates = [];
+      for (let a = 0; a < ATTEMPTS; a++) {
+        const order = shuffled([...Array(n).keys()]);
+        const ov = order.map((i) => vals[i]);
+        let best = null;
+        for (let k = 1; k <= n; k++) {
+          const lines = balancedPartition(ov, k).map(([s, e]) => {
+            const idx = order.slice(s, e);
+            const vSum = idx.reduce((sum, i) => sum + vals[i], 0);
+            const gaps = spacing * (idx.length - 1);
+            return { idx, thick: Math.max(1, (mainLen - gaps) / vSum) };
+          });
+          const total = lines.reduce((s, l) => s + l.thick, 0) + spacing * (k - 1);
+          const err = Math.abs(Math.log(total / crossLen));
+          if (!best || err < best.err) best = { err, lines, total };
+        }
+        candidates.push(best);
+      }
+      candidates.sort((x, y) => x.err - y.err);
+      // Unter den guten Kandidaten (nahe am Optimum) zufällig wählen.
+      const good = candidates.filter((c) => c.err <= candidates[0].err + 0.08);
+      const pick = good[Math.floor(Math.random() * good.length)];
+      const lines = shuffled(pick.lines);
+      const crossScale = pick.total > 0 ? crossLen / pick.total : 1;
+      return { lines, crossScale };
+    }
+
     // ROWS — Justified-rows ("Flickr"-Stil), füllt die Bühne komplett.
-    // 1) Alle Zeilenanzahlen 1..n durchprobieren, jeweils greedy nach
-    //    Aspect-Summe partitionieren, Zeilenhöhen so wählen dass Breite=stageW.
-    //    Score = wie nah die natürliche Gesamthöhe an stageH liegt.
-    // 2) Beste Aufteilung nehmen und nur vertikal nachskalieren.
     function rowsLayout(items, stageW, stageH, spacing = 0) {
       const n = items.length;
       if (!n) return [];
       if (n === 1) return gridLayout(items, stageW, stageH, spacing);
-
-      items = shuffled(items);
       const aspects = items.map((it) => it.width / it.height);
-      const totalAspect = aspects.reduce((s, a) => s + a, 0);
-
-      const partition = (k) => {
-        const target = totalAspect / k;
-        const rows = [[]];
-        let cur = 0;
-        for (let i = 0; i < n; i++) {
-          const remainItems = n - i;
-          const remainRows = k - (rows.length - 1);
-          rows[rows.length - 1].push(i);
-          cur += aspects[i];
-          const close = rows.length < k && (cur >= target || remainItems <= remainRows);
-          if (close && i < n - 1) { rows.push([]); cur = 0; }
-        }
-        return rows;
-      };
-
-      const measure = (rows) => {
-        let totalH = spacing * (rows.length - 1);
-        const heights = rows.map((row) => {
-          const aSum = row.reduce((s, idx) => s + aspects[idx], 0);
-          const gaps = spacing * (row.length - 1);
-          const h = Math.max(1, (stageW - gaps) / aSum);
-          totalH += h;
-          return h;
-        });
-        return { totalH, heights };
-      };
-
-      let bestRows = null, bestHeights = null, bestErr = Infinity;
-      for (let k = 1; k <= n; k++) {
-        const rows = partition(k);
-        const { totalH, heights } = measure(rows);
-        const err = Math.abs(Math.log(totalH / stageH));
-        if (err < bestErr) { bestErr = err; bestRows = rows; bestHeights = heights; }
-      }
-
-      const naturalH =
-        bestHeights.reduce((s, h) => s + h, 0) + spacing * (bestRows.length - 1);
-      const yScale = naturalH > 0 ? stageH / naturalH : 1;
-
+      const { lines, crossScale } = justifiedLines(aspects, stageW, stageH, spacing);
       const placed = [];
       let y = 0;
-      bestRows.forEach((row, ri) => {
-        const rowH = bestHeights[ri] * yScale;
+      lines.forEach((line) => {
+        const rowH = line.thick * crossScale;
         let x = 0;
-        row.forEach((idx) => {
-          const w = aspects[idx] * bestHeights[ri];
-          placed.push({
-            id: items[idx].id,
-            x: x + w / 2,
-            y: y + rowH / 2,
-            width: w, height: rowH,
-            rotation: 0,
-          });
+        line.idx.forEach((i) => {
+          const w = aspects[i] * line.thick;
+          placed.push({ id: items[i].id, x: x + w / 2, y: y + rowH / 2, width: w, height: rowH, rotation: 0 });
           x += w + spacing;
         });
         y += rowH + spacing;
@@ -260,71 +275,21 @@
       return placed;
     }
 
-    // COLS — gleiches Prinzip wie Rows, nur dass Fotos in Spalten gestapelt
-    // werden. Spaltenbreite füllt stageH exakt; horizontale Skalierung sorgt
-    // dafür dass die Spalten zusammen stageW füllen.
+    // COLS — wie Rows, nur dass Fotos in Spalten gestapelt werden.
     function colsLayout(items, stageW, stageH, spacing = 0) {
       const n = items.length;
       if (!n) return [];
       if (n === 1) return gridLayout(items, stageW, stageH, spacing);
-
-      items = shuffled(items);
       const inv = items.map((it) => it.height / it.width);   // h/w
-      const totalInv = inv.reduce((s, a) => s + a, 0);
-
-      const partition = (k) => {
-        const target = totalInv / k;
-        const cols = [[]];
-        let cur = 0;
-        for (let i = 0; i < n; i++) {
-          const remainItems = n - i;
-          const remainCols = k - (cols.length - 1);
-          cols[cols.length - 1].push(i);
-          cur += inv[i];
-          const close = cols.length < k && (cur >= target || remainItems <= remainCols);
-          if (close && i < n - 1) { cols.push([]); cur = 0; }
-        }
-        return cols;
-      };
-
-      const measure = (cols) => {
-        let totalW = spacing * (cols.length - 1);
-        const widths = cols.map((col) => {
-          const invSum = col.reduce((s, idx) => s + inv[idx], 0);
-          const gaps = spacing * (col.length - 1);
-          const w = Math.max(1, (stageH - gaps) / invSum);
-          totalW += w;
-          return w;
-        });
-        return { totalW, widths };
-      };
-
-      let bestCols = null, bestWidths = null, bestErr = Infinity;
-      for (let k = 1; k <= n; k++) {
-        const cols = partition(k);
-        const { totalW, widths } = measure(cols);
-        const err = Math.abs(Math.log(totalW / stageW));
-        if (err < bestErr) { bestErr = err; bestCols = cols; bestWidths = widths; }
-      }
-
-      const naturalW =
-        bestWidths.reduce((s, w) => s + w, 0) + spacing * (bestCols.length - 1);
-      const xScale = naturalW > 0 ? stageW / naturalW : 1;
-
+      const { lines, crossScale } = justifiedLines(inv, stageH, stageW, spacing);
       const placed = [];
       let x = 0;
-      bestCols.forEach((col, ci) => {
-        const colW = bestWidths[ci] * xScale;
+      lines.forEach((line) => {
+        const colW = line.thick * crossScale;
         let y = 0;
-        col.forEach((idx) => {
-          const h = inv[idx] * bestWidths[ci];
-          placed.push({
-            id: items[idx].id,
-            x: x + colW / 2,
-            y: y + h / 2,
-            width: colW, height: h,
-            rotation: 0,
-          });
+        line.idx.forEach((i) => {
+          const h = inv[i] * line.thick;
+          placed.push({ id: items[i].id, x: x + colW / 2, y: y + h / 2, width: colW, height: h, rotation: 0 });
           y += h + spacing;
         });
         x += colW + spacing;
