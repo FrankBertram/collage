@@ -383,6 +383,85 @@
       return placed;
     }
 
+    // QUILT MIX — freiere Variante des Quilts für mehr Abwechslung.
+    // Unterschiede zum Quilt:
+    //  - Schnittrichtung bei annähernd quadratischen Flächen zufällig.
+    //  - Ungleiche Count-Splits (auch 1 : Rest) → einzelne große "Hero"-Bilder.
+    //  - Flächenanteil schwankt um den Count-Anteil → große und kleine Kacheln.
+    //  - Score bestraft sehr schmale Streifen; aus den besten Kandidaten
+    //    wird zufällig gewählt, damit jeder Klick anders aussieht.
+    function quiltMixLayout(items, stageW, stageH, spacing = 0) {
+      const n = items.length;
+      if (!n) return [];
+      if (n === 1) return gridLayout(items, stageW, stageH, spacing);
+
+      const bsp = (rect, count) => {
+        if (count === 1) return [rect];
+        const ar = rect.w / rect.h;
+        const splitV = ar > 1.6 ? true : ar < 1 / 1.6 ? false : Math.random() < 0.5;
+        const leftCount = 1 + Math.floor(Math.random() * (count - 1));
+        const rightCount = count - leftCount;
+        const share = leftCount / count;
+        const ratio = Math.max(0.2, Math.min(0.8, share * (0.7 + Math.random() * 0.6)));
+        if (splitV) {
+          const w1 = rect.w * ratio;
+          return [
+            ...bsp({ x: rect.x,      y: rect.y, w: w1,          h: rect.h }, leftCount),
+            ...bsp({ x: rect.x + w1, y: rect.y, w: rect.w - w1, h: rect.h }, rightCount),
+          ];
+        }
+        const h1 = rect.h * ratio;
+        return [
+          ...bsp({ x: rect.x, y: rect.y,      w: rect.w, h: h1          }, leftCount),
+          ...bsp({ x: rect.x, y: rect.y + h1, w: rect.w, h: rect.h - h1 }, rightCount),
+        ];
+      };
+
+      const sh = shuffled(items);
+      const sortedItemArs = sh.map((it) => it.width / it.height).sort((a, b) => a - b);
+
+      const candidates = [];
+      for (let attempt = 0; attempt < 150; attempt++) {
+        const leaves = bsp({ x: 0, y: 0, w: stageW, h: stageH }, n);
+        const leafArs = leaves.map((lf) => lf.w / lf.h).sort((a, b) => a - b);
+        let score = 0;
+        for (let i = 0; i < n; i++) {
+          score += Math.abs(Math.log(sortedItemArs[i] / leafArs[i]));
+          // Streifen schmaler als 1:3 kosten extra (zu viel Beschnitt).
+          score += Math.max(0, Math.abs(Math.log(leafArs[i])) - Math.log(2.5)) * 6;
+          // Schmaler als 1:4 → praktisch verwerfen.
+          if (Math.abs(Math.log(leafArs[i])) > Math.log(4)) score += 1000;
+        }
+        candidates.push({ score, leaves });
+      }
+      candidates.sort((a, b) => a.score - b.score);
+      const top = candidates.slice(0, 6);
+      const leaves = top[Math.floor(Math.random() * top.length)].leaves;
+
+      const itemOrder = sh
+        .map((it, i) => ({ i, ar: it.width / it.height }))
+        .sort((a, b) => a.ar - b.ar);
+      const leafOrder = leaves
+        .map((lf, i) => ({ i, ar: lf.w / lf.h }))
+        .sort((a, b) => a.ar - b.ar);
+
+      const placed = new Array(n);
+      for (let k = 0; k < n; k++) {
+        const it = sh[itemOrder[k].i];
+        const lf = leaves[leafOrder[k].i];
+        const inset = Math.min(spacing, lf.w * 0.45, lf.h * 0.45);
+        placed[k] = {
+          id: it.id,
+          x: lf.x + lf.w / 2,
+          y: lf.y + lf.h / 2,
+          width: lf.w - inset,
+          height: lf.h - inset,
+          rotation: 0,
+        };
+      }
+      return placed;
+    }
+
     function scatterLayout(items, stageW, stageH) {
       const n = items.length;
       if (!n) return [];
@@ -406,6 +485,7 @@
       rows:    { label: 'Rows',    fn: rowsLayout },
       cols:    { label: 'Cols',    fn: colsLayout },
       quilt:   { label: 'Quilt',   fn: quiltLayout },
+      quiltMix:{ label: 'Quilt Mix', fn: quiltMixLayout },
       scatter: { label: 'Scatter', fn: scatterLayout },
     };
 
