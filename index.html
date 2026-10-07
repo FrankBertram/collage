@@ -55,9 +55,19 @@
     // ---------------------------------------------------------------------------
     //  constants.js
     // ---------------------------------------------------------------------------
-    const EXPORT_WIDTH = 3840;          // 4K UHD
-    const EXPORT_HEIGHT = 2160;
-    const EXPORT_ASPECT = EXPORT_WIDTH / EXPORT_HEIGHT;
+    // Export-Formate. Das Seitenverhältnis bestimmt auch die Editor-Bühne.
+    const EXPORT_FORMATS = {
+      uhd:      { label: '4K UHD (3840 × 2160 · 16:9)',            short: '4K',        width: 3840, height: 2160 },
+      // Zwei A4-Hochformat-Seiten nebeneinander: 420 × 297 mm @ 300 dpi.
+      a4doppel: { label: 'Fotobuch A4 hoch, doppelseitig (4961 × 3508 · 1,41:1)', short: 'A4 hoch', width: 4961, height: 3508 },
+      // Fotobuch 21 × 28 cm hoch, Doppelseite — Pixelmaß laut Vorgabe.
+      fb2128:   { label: 'Fotobuch 21×28 hoch, doppelseitig (5031 × 3260 · 1,54:1)', short: '21×28', width: 5031, height: 3260 },
+      // Fotobuch 21 × 28 cm hoch, Einzelseite — gleiche Höhe/Beschnitt wie die Doppelseite.
+      fb2128e:  { label: 'Fotobuch 21×28 hoch, einseitig (2551 × 3260 · 0,78:1)', short: '21×28 einseitig', width: 2551, height: 3260 },
+      // Zwei A4-Querformat-Seiten nebeneinander: 594 × 210 mm @ 300 dpi.
+      a4doppelQuer: { label: 'Fotobuch A4 quer, doppelseitig (7016 × 2480 · 2,83:1)', short: 'A4 quer', width: 7016, height: 2480 },
+    };
+    const DEFAULT_FORMAT = 'uhd';
     const PREVIEW_MAX_DIM = 1024;       // Editor-Vorschau (RAM-schonend)
     const THUMB_MAX_DIM = 240;          // Seitenleiste
     const MIN_IMAGES = 15;
@@ -150,11 +160,12 @@
     function gridLayout(items, stageW, stageH, spacing = 0) {
       const n = items.length;
       if (!n) return [];
+      const stageAr = stageW / stageH;
       let bestCols = 1, bestErr = Infinity;
       for (let cols = 1; cols <= n; cols++) {
         const rows = Math.ceil(n / cols);
         const cellAr = (stageW / cols) / (stageH / rows);
-        const err = Math.abs(Math.log(cellAr / EXPORT_ASPECT));
+        const err = Math.abs(Math.log(cellAr / stageAr));
         if (err < bestErr) { bestErr = err; bestCols = cols; }
       }
       const cols = bestCols;
@@ -435,12 +446,13 @@
 
     // ---------------------------------------------------------------------------
     //  utils/exportCanvas.js
-    //  Off-screen 4K-Render. Verwendet die Originale, nicht die Previews.
+    //  Off-screen-Render in Export-Auflösung. Verwendet die Originale, nicht die Previews.
     // ---------------------------------------------------------------------------
     async function renderCollageBlob({
-      placed, itemsById, stageW, stageH, background,
+      placed, itemsById, stageW, stageH, background, exportW, exportH,
       mime = 'image/jpeg', quality = 0.92, onProgress = () => {},
     }) {
+      const EXPORT_WIDTH = exportW, EXPORT_HEIGHT = exportH;
       const canvas = document.createElement('canvas');
       canvas.width = EXPORT_WIDTH;
       canvas.height = EXPORT_HEIGHT;
@@ -519,6 +531,7 @@
       }, []);
       const clearAll = useCallback(() => {
         setItems([]); setPlaced([]); setSelectedId(null);
+        setSwapMode(false); setSwapFirstId(null); setPanMode(false);
       }, []);
       const applyLayout = useCallback((name, sw, sh) => {
         const fn = LAYOUTS[name]?.fn;
@@ -942,7 +955,8 @@
     // ---------------------------------------------------------------------------
     function CollageEditor(props) {
       const wrapRef = useRef(null);
-      const [size, setSize] = useState({ w: 800, h: 450 });
+      const [box, setBox] = useState({ w: 824, h: 474 });
+      const aspect = props.aspect;
 
       useLayoutEffect(() => {
         if (!wrapRef.current) return;
@@ -950,13 +964,18 @@
           const cw = entry.contentRect.width - 24;
           const ch = entry.contentRect.height - 24;
           if (cw <= 0 || ch <= 0) return;
-          let w = cw, h = w / EXPORT_ASPECT;
-          if (h > ch) { h = ch; w = h * EXPORT_ASPECT; }
-          setSize({ w: Math.floor(w), h: Math.floor(h) });
+          setBox({ w: cw, h: ch });
         });
         ro.observe(wrapRef.current);
         return () => ro.disconnect();
       }, []);
+
+      // Bühnengröße aus verfügbarem Platz + Seitenverhältnis des Export-Formats.
+      const size = useMemo(() => {
+        let w = box.w, h = w / aspect;
+        if (h > box.h) { h = box.h; w = h * aspect; }
+        return { w: Math.floor(w), h: Math.floor(h) };
+      }, [box.w, box.h, aspect]);
 
       useEffect(() => { props.onStageSize?.(size.w, size.h); }, [size.w, size.h]);
 
@@ -1084,15 +1103,23 @@
     // ---------------------------------------------------------------------------
     //  Toolbar
     // ---------------------------------------------------------------------------
-    function Toolbar({ count, onUploadClick, onApplyLayout, onReset, onExportJpeg, onExportPng, exporting, swapMode, onToggleSwap, panMode, onTogglePan }) {
+    function Toolbar({ count, onUploadClick, onApplyLayout, onReset, onExportJpeg, onExportPng, exporting, swapMode, onToggleSwap, panMode, onTogglePan, format, onFormat, onClearAll }) {
       const canExport = count >= 1 && !exporting;
+      const fmt = EXPORT_FORMATS[format];
       return (
         <header className="flex flex-wrap items-center gap-2 border-b border-ink-700 bg-ink-800 px-4 py-3 shadow-soft">
           <div className="flex items-center gap-2">
             <span className="text-accent text-lg font-semibold tracking-tight">Collage Studio</span>
-            <span className="hidden text-xs text-slate-400 sm:inline">4K Export</span>
+            <span className="hidden text-xs text-slate-400 sm:inline">{fmt.width} × {fmt.height} px</span>
           </div>
           <div className="ml-auto flex flex-wrap items-center gap-2">
+            <select value={format} onChange={(e) => onFormat(e.target.value)} disabled={exporting}
+              className="rounded-md border border-ink-600 bg-ink-700 px-2 py-1.5 text-sm text-slate-200 hover:bg-ink-600 disabled:opacity-40"
+              title="Export-Format (bestimmt auch das Seitenverhältnis der Bühne)">
+              {Object.entries(EXPORT_FORMATS).map(([key, f]) => (
+                <option key={key} value={key}>{f.label}</option>
+              ))}
+            </select>
             <button onClick={onUploadClick}
               className="rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-ink-900 hover:bg-accent-soft">
               Bilder hochladen
@@ -1124,10 +1151,15 @@
               className="rounded-md border border-ink-600 px-3 py-1.5 text-sm hover:bg-ink-700 disabled:opacity-40">
               Reset
             </button>
+            <button onClick={onClearAll} disabled={count === 0 || exporting}
+              className="rounded-md border border-rose-500/60 px-3 py-1.5 text-sm text-rose-300 hover:bg-rose-500 hover:text-white disabled:opacity-40"
+              title="Alle Fotos entfernen">
+              Alle löschen
+            </button>
             <div className="flex overflow-hidden rounded-md">
               <button onClick={onExportJpeg} disabled={!canExport}
                 className="bg-emerald-500 px-3 py-1.5 text-sm font-medium text-ink-900 hover:bg-emerald-400 disabled:opacity-40">
-                JPEG (4K)
+                JPEG ({fmt.short})
               </button>
               <button onClick={onExportPng} disabled={!canExport}
                 className="border-l border-emerald-700 bg-emerald-500 px-3 py-1.5 text-sm font-medium text-ink-900 hover:bg-emerald-400 disabled:opacity-40">
@@ -1202,6 +1234,23 @@
       const [stageSize, setStageSize] = useState({ w: 1280, h: 720 });
       const onStageSize = useCallback((w, h) => setStageSize({ w, h }), []);
       const [showGrid, setShowGrid] = useState(false);
+      const [format, setFormat] = useState(DEFAULT_FORMAT);
+      const fmt = EXPORT_FORMATS[format];
+      const relayoutPending = useRef(false);
+
+      // Formatwechsel ändert die Bühnengröße → danach Grid neu rechnen,
+      // sonst liegen die Kacheln in Koordinaten der alten Bühne.
+      const onFormat = useCallback((key) => {
+        relayoutPending.current = true;
+        setFormat(key);
+      }, []);
+      useEffect(() => {
+        if (!relayoutPending.current) return;
+        relayoutPending.current = false;
+        if (!store.items.length) return;
+        store.applyLayout('grid', stageSize.w, stageSize.h);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [stageSize.w, stageSize.h]);
 
       const [exporting, setExporting] = useState(false);
       const [exportProgress, setExportProgress] = useState(0);
@@ -1250,16 +1299,18 @@
         if (!store.placed.length) return;
         setExporting(true);
         setExportProgress(0);
-        setExportLabel(`4K-${ext.toUpperCase()} wird gerendert…`);
+        setExportLabel(`${ext.toUpperCase()} ${fmt.width} × ${fmt.height} wird gerendert…`);
         try {
           const blob = await renderCollageBlob({
             placed: store.placed, itemsById: store.itemsById,
             stageW: stageSize.w, stageH: stageSize.h,
             background: store.background,
+            exportW: fmt.width, exportH: fmt.height,
             mime, quality,
             onProgress: setExportProgress,
           });
-          if (blob) downloadBlob(blob, `collage-4k-${Date.now()}.${ext}`);
+          if (blob) downloadBlob(blob, `collage-${fmt.width}x${fmt.height}-${Date.now()}.${ext}`);
+          else alert('Export fehlgeschlagen – die Auflösung ist für diesen Browser evtl. zu groß.');
         } finally {
           setExporting(false);
         }
@@ -1279,6 +1330,11 @@
             onToggleSwap={store.toggleSwapMode}
             panMode={store.panMode}
             onTogglePan={store.togglePanMode}
+            format={format}
+            onFormat={onFormat}
+            onClearAll={() => {
+              if (confirm(`Alle ${store.items.length} Fotos löschen?`)) store.clearAll();
+            }}
           />
           <div className="relative flex flex-1 overflow-hidden">
             <ThumbnailPanel
@@ -1304,6 +1360,7 @@
                 swapFirstId={store.swapFirstId}
                 panMode={store.panMode}
                 onStageSize={onStageSize}
+                aspect={fmt.width / fmt.height}
               />
               <SettingsPanel
                 background={store.background}
